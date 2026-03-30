@@ -40,12 +40,15 @@ class LineDetector(Node):
 
 
         self.bridge = CvBridge()
-        self.get_logger().info("Détection de lignes")
+        self.get_logger().info("Detection de lignes")
 
     def listener_callback(self, msg):
 
         # conversion Image ROS a OpenCV
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+        # Recuperation des dimensions de l'image
+        h, w, d = cv_image.shape
 
         # Pretraitement
         hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV) # HSV PAS RGB
@@ -54,45 +57,46 @@ class LineDetector(Node):
         # S : saturation
         # V : value / valeur
 
-        # Masque rouge : filtre qui ne laisse passer que le rouge 
-        # sur le cercle chromatique, c'est les deux extremites du cercle (0 et 180 pour H, 120 et 255 pour saturation, 70 et 255 pour V)
-        rouge_bas1, rouge_haut1 = np.array([0, 120, 70]), np.array([10, 255, 255]) # on definit les deux extremitees avec leurs seuils
+        # On calcule la ligne de coupe (ex: on garde seulement le 1/3 inferieur)
+        # Si ca tourne encore trop tot, essayez int(3*h/4) pour ne garder que le quart inferieur
+        horizon_asservissement = int(2 * h / 3)
+
+        # MASQUE ROUGE
+        rouge_bas1, rouge_haut1 = np.array([0, 120, 70]), np.array([10, 255, 255])
         rouge_bas2, rouge_haut2 = np.array([170, 120, 70]), np.array([180, 255, 255])
         mask_red = cv2.bitwise_or(cv2.inRange(hsv, rouge_bas1, rouge_haut1), 
                                   cv2.inRange(hsv, rouge_bas2, rouge_haut2))
         
-        # Masque bleu : le bleu se situe environ entre 100 et 140
-        bleu_bas, bleu_haut = np.array([100, 150, 50]), np.array([140, 255, 255])
-        mask_blue = cv2.inRange(hsv, bleu_bas, bleu_haut)
+        mask_red[0:horizon_asservissement, 0:w] = 0 # On masque le haut
 
-        # Masque vert
-        # Teinte (H) entre 40 et 80 pour le vert
+        # MASQUE VERT
         vert_bas = np.array([40, 100, 50])
         vert_haut = np.array([80, 255, 255])
         mask_green = cv2.inRange(hsv, vert_bas, vert_haut)
+        
+        mask_green[0:horizon_asservissement, 0:w] = 0 # On masque le haut
 
-        # Convertir les données compressées en tableau numpy
-        #np_arr = np.frombuffer(msg.data, np.uint8)
-        # Décoder l'image
-        #image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        # Masque Bleu : filtre qui utilise que le bas de l'image pour 
+        bleu_bas, bleu_haut = np.array([100, 150, 50]), np.array([140, 255, 255])
+        mask_blue = cv2.inRange(hsv, bleu_bas, bleu_haut)
 
-        #if image is not None:
-         #   cv2.imshow("Compressed Image", image)
-          #  cv2.waitKey(1)
-        #else:
-         #   self.get_logger().warn("Failed to decode compressed image")
+        # On met a 0 tout le haut de l'image pour ne garder que le sol.
+        # on coupe les 3/4 de l'image haute
+        mask_blue[0:int(3*h/4), 0:w] = 0
 
         # Logique anti spam
-        is_blue_now = bool(np.sum(mask_blue) > 20000) # Seuil augmenté pour plus de fiabilité
+        # On utilise countNonZero qui compte le VRAI nombre de pixels
+        pixels_bleus = cv2.countNonZero(mask_blue)
+        is_blue_now = bool(pixels_bleus > 2000) # Seuil de 2000 pixels (a ajuster si besoin)
 
         if is_blue_now and not self.blue_detected_previously:
-            # On ne publie que si on vient de découvrir la ligne (Front Montant)
+            # On ne publie que si on vient de decouvrir la ligne (Front Montant)
             blue_msg = Bool()
             blue_msg.data = True
             self.publisher_blue.publish(blue_msg)
             self.get_logger().info("Ligne bleue detectee! Envoi du signal au Superviseur.")
         
-        # Mise à jour de l'état pour la prochaine frame
+        # Mise a jour de l'etat pour la prochaine frame
         self.blue_detected_previously = is_blue_now
 
         # renvoie la position de la ligne rouge
@@ -101,7 +105,7 @@ class LineDetector(Node):
         if M['m00'] > 0:
             red_msg.data = int(M['m10'] / M['m00']) # On envoie juste le centre X
         else:
-            red_msg.data = -1 # -1 signifie "aucune ligne rouge détectée"
+            red_msg.data = -1 # -1 signifie "aucune ligne rouge detectee"
         self.publisher_red_pos.publish(red_msg)
 
         # renvoie la position de la ligne verte
@@ -116,6 +120,7 @@ class LineDetector(Node):
         # Affichage (comme dans cv_plot.py)
         cv2.imshow("Masque Rouge", mask_red)
         cv2.imshow("Masque Bleu", mask_blue)
+        cv2.imshow("Masque Vert", mask_green)
         cv2.waitKey(1)
 
 def main(args=None):
