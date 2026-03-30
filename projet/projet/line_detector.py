@@ -11,7 +11,10 @@ import cv2
 
 class LineDetector(Node):
     def __init__(self):
-        super().__init__('line_detector_node')
+        super().__init__('line_detector')
+        
+        # securite anti spam
+        self.blue_detected_previously = False
 
         # recoit l'image brute
         self.subscription = self.create_subscription(
@@ -79,12 +82,18 @@ class LineDetector(Node):
         #else:
          #   self.get_logger().warn("Failed to decode compressed image")
 
-        # Condition si le robot rencontre une ligne bleue + on le publie sur le topic
-        blue_msg = Bool()
+        # Logique anti spam
+        is_blue_now = bool(np.sum(mask_blue) > 20000) # Seuil augmenté pour plus de fiabilité
 
-        # Si on détecte une masse bleue significative
-        blue_msg.data = bool(np.sum(mask_blue) > 10000) 
-        self.publisher_blue.publish(blue_msg)
+        if is_blue_now and not self.blue_detected_previously:
+            # On ne publie que si on vient de découvrir la ligne (Front Montant)
+            blue_msg = Bool()
+            blue_msg.data = True
+            self.publisher_blue.publish(blue_msg)
+            self.get_logger().info("Ligne bleue detectee! Envoi du signal au Superviseur.")
+        
+        # Mise à jour de l'état pour la prochaine frame
+        self.blue_detected_previously = is_blue_now
 
         # renvoie la position de la ligne rouge
         red_msg = Int32()
