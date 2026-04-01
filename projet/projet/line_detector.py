@@ -10,23 +10,40 @@ class LineDetector(Node):
     def __init__(self):
         super().__init__('line_detector')
         self.blue_detected_previously = False
+        self.bridge = CvBridge()
+
+        # Offsets dynamiques auto-calibrés
+        self.offset_near_dyn = -1.0
+        self.offset_far_dyn  = -1.0
+
+        # Abonnement unique à la caméra
         self.subscription = self.create_subscription(Image, '/image_raw', self.listener_callback, 10)
 
+        # Publications pour la FSM et le Follower
         self.pub_blue      = self.create_publisher(Bool,  '/blue_line_crossed',  10)
-        self.pub_red_pos   = self.create_publisher(Int32, '/red_line_pos',        10)
-        self.pub_green_pos = self.create_publisher(Int32, '/green_line_pos',      10)
-        self.pub_red_far   = self.create_publisher(Int32, '/red_line_pos_far',    10)
-        self.pub_green_far = self.create_publisher(Int32, '/green_line_pos_far',  10)
+        self.pub_red_pos   = self.create_publisher(Int32, '/red_line_pos',       10)
+        self.pub_green_pos = self.create_publisher(Int32, '/green_line_pos',     10)
+        self.pub_red_far   = self.create_publisher(Int32, '/red_line_pos_far',   10)
+        self.pub_green_far = self.create_publisher(Int32, '/green_line_pos_far', 10)
 
-        self.bridge = CvBridge()
-        self.get_logger().info("LineDetector démarré")
+        # Nouvelles publications de configuration dynamique
+        self.pub_cam_width = self.create_publisher(Int32, '/camera_width', 10)
+        self.pub_off_near  = self.create_publisher(Int32, '/offset_near',  10)
+        self.pub_off_far   = self.create_publisher(Int32, '/offset_far',   10)
+
+        self.get_logger().info("LineDetector démarré — Mode Auto-Calibration Actif")
 
     def listener_callback(self, msg):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         h, w, _ = frame.shape
-        img_area = w * h  # Aire totale de l'image
+        img_area = w * h
+
+        # 1. On publie immédiatement la largeur réelle de la caméra
+        self.pub_cam_width.publish(Int32(data=w))
+
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
+        # Définition des couleurs
         r_lo1 = np.array([0,   100, 80]);  r_hi1 = np.array([10,  255, 255])
         r_lo2 = np.array([165, 100, 80]);  r_hi2 = np.array([180, 255, 255])
         g_lo  = np.array([38,   80, 50]);  g_hi  = np.array([85,  255, 255])
@@ -36,50 +53,70 @@ class LineDetector(Node):
         mask_g_full = cv2.inRange(hsv, g_lo, g_hi)
         mask_blue   = cv2.inRange(hsv, b_lo, b_hi)
 
-        y_near = h // 2  # On regarde des le milieu de l'image vers le bas
-        y_far  = h // 4  # On regarde encore plus loin pour la trajectoire globale
+        # Découpage de l'image
+        y_near = 6 * h // 10
+        y_far  = 4 * h // 10
         y_blue = 3 * h // 4
 
         mask_r_near = mask_r_full.copy(); mask_r_near[0:y_near, :] = 0
         mask_g_near = mask_g_full.copy(); mask_g_near[0:y_near, :] = 0
 
-        mask_r_far = mask_r_full.copy()
-        mask_r_far[0:y_far,  :] = 0
-        mask_r_far[y_near:h, :] = 0
-        mask_g_far = mask_g_full.copy()
-        mask_g_far[0:y_far,  :] = 0
-        mask_g_far[y_near:h, :] = 0
+        mask_r_far = mask_r_full.copy(); mask_r_far[0:y_far, :] = 0; mask_r_far[y_near:h, :] = 0
+        mask_g_far = mask_g_full.copy(); mask_g_far[0:y_far, :] = 0; mask_g_far[y_near:h, :] = 0
 
         mask_blue[0:y_blue, :] = 0
         
-        # Seuils adaptatifs en fonction de la taille de l'image
+        # Détection Ligne Bleue
         pixels_bleus = cv2.countNonZero(mask_blue)
-        is_blue_now  = pixels_bleus > (img_area * 0.005) # eq. 1500px pour 640x480
-        
+        is_blue_now  = pixels_bleus > (img_area * 0.005)
         if is_blue_now and not self.blue_detected_previously:
             self.pub_blue.publish(Bool(data=True))
-            self.get_logger().info("Ligne bleue → signal superviseur")
         self.blue_detected_previously = is_blue_now
 
-        min_area_near = img_area * 0.0010  # egale a 300px pour 640x480
-        min_area_far  = img_area * 0.0006  # egale a 180px pour 640x480
+        # Calcul des centres (moments)
+        min_area_near = img_area * 0.0010
+        min_area_far  = img_area * 0.0006
 
-        self._pub_cx(mask_r_near, min_area_near, self.pub_red_pos)
-        self._pub_cx(mask_g_near, min_area_near, self.pub_green_pos)
-        self._pub_cx(mask_r_far,  min_area_far,  self.pub_red_far)
-        self._pub_cx(mask_g_far,  min_area_far,  self.pub_green_far)
+        cx_r_near = self._get_cx(mask_r_near, min_area_near)
+        cx_g_near = self._get_cx(mask_g_near, min_area_near)
+        cx_r_far  = self._get_cx(mask_r_far,  min_area_far)
+        cx_g_far  = self._get_cx(mask_g_far,  min_area_far)
 
-        cv2.imshow("Rouge near", mask_r_near)
-        cv2.imshow("Rouge far",  mask_r_far)
-        cv2.imshow("Vert  near", mask_g_near)
-        cv2.imshow("Vert  far",  mask_g_far)
+        # -------------------------------------------------------------
+        # AUTO-CALIBRATION DES OFFSETS
+        # Si on voit les DEUX lignes, on apprend la largeur de la piste
+        # -------------------------------------------------------------
+        if cx_r_near != -1 and cx_g_near != -1:
+            mesure_actuelle = (cx_r_near - cx_g_near) / 2.0
+            if self.offset_near_dyn == -1.0:
+                self.offset_near_dyn = mesure_actuelle
+            else:
+                # Moyenne glissante : 90% d'historique, 10% de nouveauté
+                self.offset_near_dyn = 0.90 * self.offset_near_dyn + 0.10 * mesure_actuelle
+            self.pub_off_near.publish(Int32(data=int(self.offset_near_dyn)))
+
+        if cx_r_far != -1 and cx_g_far != -1:
+            mesure_actuelle = (cx_r_far - cx_g_far) / 2.0
+            if self.offset_far_dyn == -1.0:
+                self.offset_far_dyn = mesure_actuelle
+            else:
+                self.offset_far_dyn = 0.90 * self.offset_far_dyn + 0.10 * mesure_actuelle
+            self.pub_off_far.publish(Int32(data=int(self.offset_far_dyn)))
+
+        # Publication des positions
+        self.pub_red_pos.publish(Int32(data=cx_r_near))
+        self.pub_green_pos.publish(Int32(data=cx_g_near))
+        self.pub_red_far.publish(Int32(data=cx_r_far))
+        self.pub_green_far.publish(Int32(data=cx_g_far))
+
+        cv2.imshow("Vision Nette", cv2.bitwise_or(mask_r_near, mask_g_near))
         cv2.waitKey(1)
 
-    def _pub_cx(self, mask, min_area, publisher):
+    def _get_cx(self, mask, min_area):
         M = cv2.moments(mask)
-        msg = Int32()
-        msg.data = int(M['m10'] / M['m00']) if M['m00'] > min_area else -1
-        publisher.publish(msg)
+        if M['m00'] > min_area:
+            return int(M['m10'] / M['m00'])
+        return -1
 
 def main(args=None):
     rclpy.init(args=args)

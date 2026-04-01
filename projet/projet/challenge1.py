@@ -11,13 +11,25 @@ STATE_EXITING    = 'EXITING'
 
 FRAMES_CONFIRMATION = 5
 DUREE_MIN_ROUNDABOUT = 4.0
-BIAIS = 0.50                 # sert a choisir la direction dans laquelle on prend le rond point mais a voir
+BIAIS = 0.50                 # sert a choisir la direction dans laquelle on prend le rond point
 
 class Challenge1(Node):
     def __init__(self):
         super().__init__('challenge1')
 
-        self.declare_parameter('roundabout', 'right')
+        print("\n" + "="*60)
+        print("CONFIGURATION DU ROND-POINT")
+        choix_direction = ""
+        while choix_direction not in ['left', 'right']:
+            choix_direction = input(" De quel côté prendre le rond-point ? (tapez 'left' ou 'right') : ").strip().lower()
+            if choix_direction not in ['left', 'right']:
+                print("Entrée invalide. Veuillez taper 'left' ou 'right'.")
+        print("="*60 + "\n")
+
+        # On initialise le paramètre avec le choix de l'utilisateur
+        self.declare_parameter('roundabout', choix_direction)
+        
+        # ... Reste des paramètres
         self.declare_parameter('camera_width', 640)
         cam_width = self.get_parameter('camera_width').value
 
@@ -43,6 +55,8 @@ class Challenge1(Node):
         self.cx_red_far    = -1
         self.cx_green_far  = -1
         self.cpt_entree = 0
+        
+        self.get_logger().info(f"Challenge 1, direction choisie : {choix_direction.upper()}")
 
     def cb_scan(self, msg):
         angles = list(range(0, 21)) + list(range(340, 360))
@@ -89,7 +103,6 @@ class Challenge1(Node):
                 return self.cmd(cmd, 0.0)
             
             # Pendant les premieres secondes du rond-point, on applique le biais fortement
-            # Une fois "insere" dans le rond point, le LineFollower se debrouille avec les lignes
             biais_actif = self.biais(direction) if dt < 1.5 else 0.0
             return self.cmd(cmd, biais_actif)
 
@@ -102,13 +115,10 @@ class Challenge1(Node):
 
     def ecart(self, cx_red, cx_green):
         if cx_red == -1 or cx_green == -1: return None
-        # Si les couleurs se croisent visuellement (ilot central), l'ecart devient negatif
         return cx_red - cx_green
 
     def critere_entree(self, ecart_far) -> bool:
         if ecart_far is None: return False
-        # Le rond-point est detecte au loin : la separation fait chuter brutalement l'ecart far
-        # Parfois cet ecart devient negatif car le rouge de l'elot passe a gauche du vert.
         ilot_vu_au_loin = ecart_far < self.seuil_ecart_far
         return ilot_vu_au_loin
 
@@ -121,7 +131,6 @@ class Challenge1(Node):
 
     def cmd(self, cmd: Twist, biais: float, reduire_vitesse=False) -> Twist:
         t = Twist()
-        # On ralentit au moment ou on doit s'inserer pour que le biais ait plus d'impact
         t.linear.x  = max(cmd.linear.x, 0.05) if not reduire_vitesse else 0.05
         t.angular.z = cmd.angular.z + biais
         return t
