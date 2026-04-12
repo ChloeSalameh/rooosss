@@ -28,7 +28,8 @@ setup(
             'line_detector = projet.line_detector:main',
             'superviseur = projet.superviseur:main',
             'line_follower = projet.line_follower:main',
-            'challenge1 = projet.challenge1:main'
+            'challenge1 = projet.challenge1:main',
+            'challenge2 = projet.challenge2:main',
         ],
     },
 )
