@@ -12,33 +12,28 @@ class LineDetector(Node):
         self.blue_detected_previously = False
         self.bridge = CvBridge()
 
-        # Offsets dynamiques auto-calibrés
         self.offset_near_dyn = -1.0
         self.offset_far_dyn  = -1.0
 
-        # Abonnement unique à la caméra
         self.subscription = self.create_subscription(Image, '/image_raw', self.listener_callback, 10)
 
-        # Publications pour la FSM et le Follower
         self.pub_blue      = self.create_publisher(Bool,  '/blue_line_crossed',  10)
         self.pub_red_pos   = self.create_publisher(Int32, '/red_line_pos',       10)
         self.pub_green_pos = self.create_publisher(Int32, '/green_line_pos',     10)
         self.pub_red_far   = self.create_publisher(Int32, '/red_line_pos_far',   10)
         self.pub_green_far = self.create_publisher(Int32, '/green_line_pos_far', 10)
 
-        # Nouvelles publications de configuration dynamique
         self.pub_cam_width = self.create_publisher(Int32, '/camera_width', 10)
         self.pub_off_near  = self.create_publisher(Int32, '/offset_near',  10)
         self.pub_off_far   = self.create_publisher(Int32, '/offset_far',   10)
 
-        self.get_logger().info("LineDetector démarré — Mode Auto-Calibration Actif")
+        self.get_logger().info("LineDetector démarré — Filtre volume 3D Actif")
 
     def listener_callback(self, msg):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         h, w, _ = frame.shape
         img_area = w * h
 
-        # 1. On publie immédiatement la largeur réelle de la caméra
         self.pub_cam_width.publish(Int32(data=w))
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -53,10 +48,9 @@ class LineDetector(Node):
         mask_g_full = cv2.inRange(hsv, g_lo, g_hi)
         mask_blue   = cv2.inRange(hsv, b_lo, b_hi)
 
-        # Découpage de l'image
+        # Découpage de l'image pour le suivi de ligne (Rouge/Vert)
         y_near = 6 * h // 10
         y_far  = 4 * h // 10
-        y_blue = 3 * h // 4
 
         mask_r_near = mask_r_full.copy(); mask_r_near[0:y_near, :] = 0
         mask_g_near = mask_g_full.copy(); mask_g_near[0:y_near, :] = 0
@@ -64,14 +58,31 @@ class LineDetector(Node):
         mask_r_far = mask_r_full.copy(); mask_r_far[0:y_far, :] = 0; mask_r_far[y_near:h, :] = 0
         mask_g_far = mask_g_full.copy(); mask_g_far[0:y_far, :] = 0; mask_g_far[y_near:h, :] = 0
 
-        mask_blue[0:y_blue, :] = 0
+        # =================================================================
+        # FIX LIGNE BLEUE SIMPLIFIÉ
+        # =================================================================
+        # On regarde une bande horizontale légèrement en avance sur le robot
+        # par exemple entre (h - 100) et (h - 20)
         
-        # Détection Ligne Bleue
-        pixels_bleus = cv2.countNonZero(mask_blue)
-        is_blue_now  = pixels_bleus > (img_area * 0.005)
+        y_top = h - 100
+        y_bottom = h - 20
+        
+        mask_blue_roi = mask_blue.copy()
+        mask_blue_roi[0:y_top, :] = 0
+        mask_blue_roi[y_bottom:h, :] = 0
+
+        # On compte les pixels bleus dans cette bande
+        pixels_bleus = cv2.countNonZero(mask_blue_roi)
+        
+        # Si on voit une bonne quantité de bleu (ex: > 500 pixels), c'est la ligne
+        is_blue_now = pixels_bleus > 500 
+        
         if is_blue_now and not self.blue_detected_previously:
+            self.get_logger().info(f"🔵 Ligne Bleue Détectée ! ({pixels_bleus} px)")
             self.pub_blue.publish(Bool(data=True))
+            
         self.blue_detected_previously = is_blue_now
+        # =================================================================
 
         # Calcul des centres (moments)
         min_area_near = img_area * 0.0010
@@ -82,16 +93,11 @@ class LineDetector(Node):
         cx_r_far  = self._get_cx(mask_r_far,  min_area_far)
         cx_g_far  = self._get_cx(mask_g_far,  min_area_far)
 
-        # -------------------------------------------------------------
-        # AUTO-CALIBRATION DES OFFSETS
-        # Si on voit les DEUX lignes, on apprend la largeur de la piste
-        # -------------------------------------------------------------
         if cx_r_near != -1 and cx_g_near != -1:
             mesure_actuelle = (cx_r_near - cx_g_near) / 2.0
             if self.offset_near_dyn == -1.0:
                 self.offset_near_dyn = mesure_actuelle
             else:
-                # Moyenne glissante : 90% d'historique, 10% de nouveauté
                 self.offset_near_dyn = 0.90 * self.offset_near_dyn + 0.10 * mesure_actuelle
             self.pub_off_near.publish(Int32(data=int(self.offset_near_dyn)))
 
@@ -103,7 +109,6 @@ class LineDetector(Node):
                 self.offset_far_dyn = 0.90 * self.offset_far_dyn + 0.10 * mesure_actuelle
             self.pub_off_far.publish(Int32(data=int(self.offset_far_dyn)))
 
-        # Publication des positions
         self.pub_red_pos.publish(Int32(data=cx_r_near))
         self.pub_green_pos.publish(Int32(data=cx_g_near))
         self.pub_red_far.publish(Int32(data=cx_r_far))

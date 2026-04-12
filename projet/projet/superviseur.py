@@ -9,7 +9,11 @@ class Superviseur(Node):
         super().__init__('superviseur')
         
         # 1 = Suivi de ligne, 2 = Obstacles, 3 = Couloir, 4 = Foot, 5 = Controle humain
-        self.current_state = 1
+        self.declare_parameter('initial_state', 1)
+        self.current_state = self.get_parameter('initial_state').value
+        
+        # --- CORRECTION : Flag à -1.0 pour forcer la synchro avec l'horloge Gazebo ---
+        self.last_transition_time = -1.0 
         
         # Variables pour sauvegarder les "suggestions" de chaque challenge
         self.last_twist_ch1 = Twist()
@@ -18,12 +22,12 @@ class Superviseur(Node):
         self.last_twist_ch4 = Twist()
         self.last_twist_ch5 = Twist()
 
-        # deection de la ligne bleue
+        # detection de la ligne bleue
         self.sub_blue_line = self.create_subscription(
             Bool,
             '/blue_line_crossed',
             self.state_callback,
-            10 # Taille de la file d'attente (QoS)
+            10
         )
 
         # On s'abonne aux topics intermediaires de chaque challenge
@@ -39,38 +43,47 @@ class Superviseur(Node):
         timer_period = 0.1 
         self.timer = self.create_timer(timer_period, self.timer_callback)
         
-        self.get_logger().info('Challenge : 1')
+        self.get_logger().info(f'Superviseur démarré — Challenge initial : {self.current_state}')
     
 
     def state_callback(self, msg):
-        """se declanche quand on publie sur /blue_line_crossed"""
+        """se declenche quand on publie sur /blue_line_crossed"""
         if msg.data == True:
-            self.current_state += 1
-            self.get_logger().info(f"Passage au challenge {self.current_state}")
+            # FIX ICI : On vérifie strictement l'état initial (-1.0)
+            if self.last_transition_time == -1.0: 
+                return
 
-    def cmd_ch1_callback(self, msg):
-        """Sauvegarde la commande du Challenge 1"""
-        self.last_twist_ch1 = msg
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            
+            # CORRECTION : Augmentation à 35 secondes (le robot est lent !)
+            duree_ecoulee = current_time - self.last_transition_time
+            if duree_ecoulee > 35.0:
+                self.current_state += 1
+                self.last_transition_time = current_time
+                self.get_logger().info(f"======== LIGNE BLEUE VALIDÉE ! PASSAGE AU CHALLENGE {self.current_state} ========")
+            else:
+                # Faux positif (Pilier bleu détecté pendant le cooldown)
+                temps_restant = 35.0 - duree_ecoulee
+                self.get_logger().warn(f"Objet bleu ignoré (Pilier). Fin de sécurité dans {temps_restant:.1f}s")
 
-    def cmd_ch2_callback(self, msg):
-        """Sauvegarde la commande du Challenge 2"""
-        self.last_twist_ch2 = msg
 
-    def cmd_ch3_callback(self, msg):
-        """Sauvegarde la commande du Challenge 3"""
-        self.last_twist_ch3 = msg
-
-    def cmd_ch4_callback(self, msg):
-        """Sauvegarde la commande du Challenge 4"""
-        self.last_twist_ch4 = msg
-
-    def cmd_ch5_callback(self, msg):
-        """Sauvegarde la commande du Challenge 5"""
-        self.last_twist_ch5 = msg
+    def cmd_ch1_callback(self, msg): self.last_twist_ch1 = msg
+    def cmd_ch2_callback(self, msg): self.last_twist_ch2 = msg
+    def cmd_ch3_callback(self, msg): self.last_twist_ch3 = msg
+    def cmd_ch4_callback(self, msg): self.last_twist_ch4 = msg
+    def cmd_ch5_callback(self, msg): self.last_twist_ch5 = msg
     
 
     def timer_callback(self):
         """ boucle a 10Hz decide de quoi publier."""
+        
+        # --- CORRECTION : Synchronisation du timer avec le démarrage de Gazebo ---
+        if self.last_transition_time == -1.0:
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            if current_time > 0: # On attend que Gazebo commence à publier le temps
+                self.last_transition_time = current_time - 40
+                self.get_logger().info("Horloge simulée synchronisée, timer de sécurité activé.")
+
         twist_to_publish = Twist()
         
         if self.current_state == 1:
