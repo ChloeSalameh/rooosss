@@ -2,203 +2,202 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool, Int32
-import math
+from std_msgs.msg import Int32
+import numpy as np
+import queue
+import time
 
-STATE_FOLLOW   = 'FOLLOW'
-STATE_HUGGING  = 'HUGGING'    
-STATE_RECENTER = 'RECENTER'
+# =============================================================================
+# PARAMÈTRES AJUSTABLES (CONFIGURATION)
+# =============================================================================
 
-# ── LiDAR : Découpage sans angle mort
-CONE_FRONT_C  = 15   # 345° à 15°   (Plein centre)
-CONE_FRONT_L  = 75   # 15° à 75°    (Avant Gauche)
-CONE_SIDE_L   = 135  # 75° à 135°   (Côté Gauche)
+# --- Contrôleur Latéral (Évitement gauche/droite) ---
+LAT_KP = 4.0
+LAT_KI = 0.0
+LAT_KD = 0.8
+LAT_KS = 10    # Taille de la fenêtre d'intégration (Saturation)
 
-CONE_FRONT_R  = 345  # 285° à 345°  (Avant Droite)
-CONE_SIDE_R   = 285  # 225° à 285°  (Côté Droite)
+# --- Contrôleur Longitudinal (Vitesse d'approche) ---
+LON_KP = 1.2
+LON_KI = 0.0
+LON_KD = 0.05
+LON_KS = 10
 
-# ── Seuils d'anticipation et de dégagement
-DIST_ANTICIPATION = 0.90  # (On garde 0.70, c'était la bonne idée)
-DIST_CLEAR_FRONT  = 0.30  # BAISSÉ : L'obstacle n'est plus pile devant
-DIST_CLEAR_SIDE   = 0.20  # BAISSÉ (Crucial) : Permet de valider le dépassement même sur piste étroite
+# --- Seuils de Distance (en mètres) ---
+SEUIL_EVITEMENT   = 0.65   # Distance de détection de l'obstacle
+TARGET_CLEARANCE  = 0.35   # Distance latérale à maintenir avec le pilier
 
-# ── Paramètres Visuels (Marge de sécurité anti-franchissement)
-# RAPPROCHÉ DU CENTRE : 0.58 et 0.42 gardent fermement le robot sur la piste
-PCT_TARGET_RED   = 0.90
-PCT_TARGET_GREEN = 0.10
+# --- Limites de Vitesse ---
+LIN_SPEED_MIN     = 0.04   # Vitesse minimale pendant l'évitement
+LIN_SPEED_MAX     = 0.07   # Vitesse maximale pendant l'évitement
+ANG_SPEED_LIMIT   = 1.5    # Vitesse angulaire max autorisée (rad/s)
 
-KP_VIS = 0.008  # Un peu plus nerveux pour s'aligner vite
-KD_VIS = 0.015
-V_HUGGING = 0.08
+# --- Pare-chocs Visuel (Protection de ligne) ---
+BUMPER_MARGIN_PCT = 0.13   # Marge de sécurité par rapport au centre (0.13 = 13%)
+BUMPER_GAIN       = 0.012  # Force de répulsion de la ligne colorée
+
+# --- Fusion de Trajectoire ---
+FOLLOW_WEIGHT     = 0.9    # Poids du suiveur de ligne pendant l'évitement (0.0 à 1.0)
+
+
+# =============================================================================
+# CLASSES ET LOGIQUE DE CONTRÔLE
+# =============================================================================
+
+class PIDController:
+    def __init__(self, kP, kI, kD, kS):
+        self.kP       = kP 
+        self.kI       = kI 
+        self.kD       = kD 
+        self.kS       = kS 
+        self.err_int  = 0.0 
+        self.err_dif  = 0.0 
+        self.err_prev = 0.0 
+        self.err_hist = queue.Queue(self.kS) 
+        self.t_prev   = 0.0 
+
+    def control(self, err, t):
+        if self.t_prev == 0.0:
+            self.t_prev = t
+            return self.kP * err
+
+        dt = t - self.t_prev 
+        if dt > 0.0:
+            self.err_hist.put(err) 
+            self.err_int += err * dt
+            if self.err_hist.full(): 
+                self.err_int -= self.err_hist.get() * dt
+            self.err_dif = (err - self.err_prev) 
+            u = (self.kP * err) + (self.kI * self.err_int) + (self.kD * self.err_dif / dt) 
+            self.err_prev = err 
+            self.t_prev = t 
+            return u 
+        return 0.0
+
 
 class Challenge2(Node):
     def __init__(self):
         super().__init__('challenge2')
 
-        self.state     = STATE_FOLLOW
-        self.is_active = False
+        # ── Abonnements (Les topics restent ici) ──────────────────────────────
+        self.create_subscription(LaserScan, '/scan',             self.cb_scan,       10)
+        self.create_subscription(Twist,     '/cmd_vel_line_raw', self.cb_cmd_line,   10)
+        self.create_subscription(Int32,     '/red_line_pos',     self.cb_red_near,   10)
+        self.create_subscription(Int32,     '/green_line_pos',   self.cb_green_near, 10)
+        self.create_subscription(Int32,     '/camera_width',     self.cb_cam_width,  10)
         
-        self.target_line = None 
+        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel_challenge_2', 10)
 
-        self.front_min  = 999.0
-        self.front_left = 999.0
-        self.side_left  = 999.0
-        self.front_right= 999.0
-        self.side_right = 999.0
+        # ── [MODIFIED] Initialisation de deux Contrôleurs Latéraux Indépendants ────────
+        self.pid_lat_left  = PIDController(LAT_KP, LAT_KI, LAT_KD, LAT_KS)
+        self.pid_lat_right = PIDController(LAT_KP, LAT_KI, LAT_KD, LAT_KS)
+        self.pid_lon       = PIDController(LON_KP, LON_KI, LON_KD, LON_KS)
 
+        # ── Variables d'état ──────────────────────────────────────────────────
+        self.laserscan     = None
+        self.cmd_line      = Twist()
+        self.cam_width     = 640.0
         self.cx_red_near   = -1
         self.cx_green_near = -1
-        self.cam_width     = 640.0
+        self.data_available = False
 
-        self.last_err_vis = 0.0
-        self.cpt_clear    = 0
-        self.cpt_recenter = 0
+        self.create_timer(0.05, self.compute_and_publish)
+        self.get_logger().info("Challenge 2 prêt : Variables de configuration déportées en haut du fichier.")
 
-        self.create_subscription(LaserScan, '/scan',                self.cb_scan,       10)
-        self.create_subscription(Twist,     '/cmd_vel_challenge_1', self.cb_cmd,        10)
-        self.create_subscription(Bool,      '/blue_line_crossed',   self.cb_blue_line,  10)
-        self.create_subscription(Int32,     '/red_line_pos',        self.cb_red_near,   10)
-        self.create_subscription(Int32,     '/green_line_pos',      self.cb_green_near, 10)
-        self.create_subscription(Int32,     '/camera_width',        self.cb_cam_width,  10)
+    def cb_scan(self, msg):
+        ranges = np.asarray(msg.ranges)
+        ranges[np.isinf(ranges)] = 3.5
+        ranges[ranges == 0.0] = 3.5
+        ranges[ranges > 3.5] = 3.5
+        self.laserscan = ranges
+        self.data_available = True
 
-        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel_challenge_2', 10)
-        self.get_logger().info("Challenge 2 — Anticipation 0.7m & Marges Sécurisées")
+    def cb_cmd_line(self, msg): self.cmd_line = msg
+    def cb_red_near(self, msg): self.cx_red_near = msg.data
+    def cb_green_near(self, msg): self.cx_green_near = msg.data
+    def cb_cam_width(self, msg): self.cam_width = float(msg.data)
 
-    def cb_blue_line(self, msg: Bool):
-        if msg.data and not self.is_active:
-            self.is_active = True
-            self.get_logger().info("Ligne bleue ✓ — Challenge 2 ACTIF")
-
-    def cb_cam_width(self, msg: Int32):   self.cam_width = float(msg.data) if msg.data > 0 else 640.0
-    def cb_red_near(self,   msg: Int32):  self.cx_red_near   = msg.data
-    def cb_green_near(self, msg: Int32):  self.cx_green_near = msg.data
-
-    def cb_scan(self, msg: LaserScan):
-        n = len(msg.ranges)
-        def safe_min(start_deg, end_deg):
-            vals = []
-            for i in range(start_deg, end_deg + 1):
-                d = msg.ranges[i % n]
-                if 0.05 < d < 3.0 and not math.isinf(d): vals.append(d)
-            return min(vals) if vals else 999.0
-
-        self.front_min   = safe_min(360 - CONE_FRONT_C, CONE_FRONT_C)
-        self.front_left  = safe_min(CONE_FRONT_C, CONE_FRONT_L)
-        self.side_left   = safe_min(CONE_FRONT_L, CONE_SIDE_L)
-        self.side_right  = safe_min(CONE_SIDE_R, CONE_FRONT_R)
-        self.front_right = safe_min(CONE_FRONT_R, 360 - CONE_FRONT_C)
-
-    def cb_cmd(self, cmd_raw: Twist):
-        if not self.is_active:
-            self.pub_cmd.publish(cmd_raw)
+    def compute_and_publish(self):
+        if not self.data_available or self.laserscan is None:
             return
-        self.pub_cmd.publish(self.fsm_step(cmd_raw))
 
-    def fsm_step(self, cmd_raw: Twist) -> Twist:
-        danger_ahead = min(self.front_min, self.front_left, self.front_right) < DIST_ANTICIPATION
+        tstamp = time.time()
+        cmd_out = Twist()
 
-        if self.state == STATE_FOLLOW or self.state == STATE_RECENTER:
-            if danger_ahead:
-                self._lock_target_line()
-                self.transition(STATE_HUGGING)
-                return self._state_hugging()
-            
-            if self.state == STATE_RECENTER:
-                return self._state_recenter(cmd_raw)
-            return cmd_raw
+        # 1. [MODIFIED] CORRECTION LIDAR: Réduction de l'angle pour éviter les "obstacles fantômes"
+        front_sector = np.concatenate((self.laserscan[0:25], self.laserscan[335:360]))
+        left_sector  = self.laserscan[0:60]    # Réduit de 90 à 60
+        right_sector = self.laserscan[300:360] # Réduit de 270 à 300
 
-        elif self.state == STATE_HUGGING:
-            return self._state_hugging()
+        min_front = np.min(front_sector)
+        min_left  = np.min(left_sector)
+        min_right = np.min(right_sector)
 
-        return cmd_raw
+        # Détection d'obstacle
+        if min(min_front, min_left, min_right) > SEUIL_EVITEMENT:
+            self.pub_cmd.publish(self.cmd_line)
+            return
 
-    def _lock_target_line(self):
-        if self.front_left < self.front_right:
-            self.target_line = 'red'
-            c_str = "ROUGE (Droite)"
+        # --- [MODIFIED] CALCUL ÉVITEMENT CORRIGÉ (CHAMPS DE POTENTIELS) ---
+        
+        # Répulsion de l'obstacle à gauche (pousse vers la droite -> oméga négatif)
+        error_left = max(0.0, TARGET_CLEARANCE - min_left)
+        omega_left = -self.pid_lat_left.control(error_left, tstamp)
+
+        # Répulsion de l'obstacle à droite (pousse vers la gauche -> oméga positif)
+        error_right = max(0.0, TARGET_CLEARANCE - min_right)
+        omega_right = self.pid_lat_right.control(error_right, tstamp)
+
+        # On additionne les forces au lieu d'utiliser un if/else ! 
+        # Cela empêche les pics de dérivation et gère les doubles obstacles naturellement.
+        omega_pid = omega_left + omega_right
+
+        # Vitesse linéaire bridée
+        v_lin = self.pid_lon.control(min_front, tstamp)
+        v_lin = max(LIN_SPEED_MIN, min(LIN_SPEED_MAX, v_lin))
+
+        # --- PARE-CHOCS VISUEL CORRIGÉ ---
+        margin = self.cam_width * BUMPER_MARGIN_PCT
+        center = self.cam_width / 2.0
+        
+        safe_red_min   = center + margin
+        safe_green_max = center - margin
+
+        omega_final = omega_pid
+        bumper_active = False
+        omega_bumper_total = 0.0
+
+        # 3. SYMÉTRIE DU BUMPER: On additionne les forces au lieu d'utiliser min/max
+        if self.cx_red_near != -1 and self.cx_red_near < safe_red_min:
+            omega_bumper_total += BUMPER_GAIN * (safe_red_min - self.cx_red_near)
+            bumper_active = True
+
+        if self.cx_green_near != -1 and self.cx_green_near > safe_green_max:
+            omega_bumper_total += BUMPER_GAIN * (safe_green_max - self.cx_green_near)
+            bumper_active = True
+
+        # Application de la force du pare-chocs ou du suiveur de ligne
+        if bumper_active:
+            omega_final += omega_bumper_total
         else:
-            self.target_line = 'green'
-            c_str = "VERTE (Gauche)"
-            
-        self.last_err_vis = 0.0 
-        self.cpt_clear = 0
-        self.cpt_recenter = 0
-        self.get_logger().info(f"🎯 Obstacle à {min(self.front_left, self.front_right):.2f}m -> Je colle {c_str}")
+            omega_final += FOLLOW_WEIGHT * self.cmd_line.angular.z
 
-    def _is_current_obstacle_cleared(self):
-        if self.target_line == 'red':
-            return self.front_left > DIST_CLEAR_FRONT and self.side_left > DIST_CLEAR_SIDE
-        else:
-            return self.front_right > DIST_CLEAR_FRONT and self.side_right > DIST_CLEAR_SIDE
+        # Commande finale avec limite stricte
+        cmd_out.linear.x  = float(v_lin)
+        cmd_out.angular.z = float(max(-ANG_SPEED_LIMIT, min(ANG_SPEED_LIMIT, omega_final)))
 
-    def _state_hugging(self) -> Twist:
-        err_vis = 0.0
-        omega_vis = 0.0
-        
-        if self.target_line == 'red':
-            if self.cx_red_near != -1:
-                cible = self.cam_width * PCT_TARGET_RED
-                err_vis = cible - self.cx_red_near
-                d_err = err_vis - self.last_err_vis
-                self.last_err_vis = err_vis
-                omega_vis = (KP_VIS * err_vis) + (KD_VIS * d_err)
-            else:
-                omega_vis = -0.4 
-                self.last_err_vis = 0.0
-
-        elif self.target_line == 'green':
-            if self.cx_green_near != -1:
-                cible = self.cam_width * PCT_TARGET_GREEN
-                err_vis = cible - self.cx_green_near
-                d_err = err_vis - self.last_err_vis
-                self.last_err_vis = err_vis
-                omega_vis = (KP_VIS * err_vis) + (KD_VIS * d_err)
-            else:
-                omega_vis = 0.4
-                self.last_err_vis = 0.0
-
-        omega_total = max(-0.8, min(0.8, omega_vis))
-
-        if self._is_current_obstacle_cleared():
-            self.cpt_clear += 1
-        else:
-            self.cpt_clear = 0
-
-        if self.cpt_clear >= 5:
-            self.cpt_clear = 0
-            self.get_logger().info("✅ Pilier franchi -> Retour au centre")
-            self.transition(STATE_RECENTER)
-
-        out = Twist()
-        out.linear.x = V_HUGGING * max(0.6, 1.0 - abs(omega_total))
-        out.angular.z = omega_total
-        return out
-
-    def _state_recenter(self, cmd_raw: Twist) -> Twist:
-        out = Twist()
-        out.linear.x = cmd_raw.linear.x * 0.9 
-        
-        # On donne un peu plus de puissance au recentrage pour qu'il le fasse VITE
-        out.angular.z = max(-1.0, min(1.0, cmd_raw.angular.z * 1.2))
-        
-        self.cpt_recenter += 1
-        
-        if self.cpt_recenter > 20:
-            self.cpt_recenter = 0
-            self.get_logger().info("Milieu de piste atteint -> FOLLOW")
-            self.transition(STATE_FOLLOW)
-            
-        return out
-
-    def transition(self, new_state: str):
-        self.state = new_state
-        self.get_logger().info(f"FSM → {new_state}")
+        self.pub_cmd.publish(cmd_out)
 
 def main(args=None):
     rclpy.init(args=args)
     node = Challenge2()
-    try: rclpy.spin(node)
-    except KeyboardInterrupt: pass
-    finally: node.destroy_node(); rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    main()

@@ -77,13 +77,13 @@ class Challenge1(Node):
         # Ces seuils sont asymétriques par rapport à 0.5 pour garantir que
         # le robot est déjà orienté dans la bonne direction avant de démarrer
         # le suivi PD — évitant une correction initiale trop brutale.
-        self.seuil_alignement_droite = 0.60   # cx_red  / cam_width  > seuil
-        self.seuil_alignement_gauche = 0.40   # cx_green / cam_width < seuil
+        self.seuil_alignement_droite = 0.75   # cx_red  / cam_width  > seuil
+        self.seuil_alignement_gauche = 0.25   # cx_green / cam_width < seuil
 
         # ── Seuil de détection de sortie du rond-point ───────────────────────
         # On détecte la sortie quand les 2 lignes sont à nouveau bien visibles
         # et bien écartées (on retrouve la piste normale).
-        self.seuil_ecart_sortie = 0.30   # écart > 30% de la largeur = sortie
+        self.seuil_ecart_sortie = 0.45   # écart > 30% de la largeur = sortie
 
         # ── Seuil de suivi nominal (validation fin de sortie) ─────────────────
         # L'écart "normal" entre les 2 lignes en suivi stable.
