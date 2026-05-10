@@ -21,10 +21,9 @@ ZONE_TOP_FRAC = 0.50   # fraction haute de la zone d'analyse (0.0 = tout en haut
 ZONE_BOT_FRAC = 1.00   # fraction basse de la zone d'analyse (1.0 = tout en bas)
 
 # Pourcentage minimum de pixels dans une bande pour valider un centroide
-# (0.001 = 0.1% — robuste au bruit, valeur exacte de l'antérieur)
 MIN_AREA_PCT = 0.001
 
-# Nombre minimum de pixels bleus pour déclencher la détection
+# Nombre minimum de pixels bleus pour declencher la detection
 BLUE_MIN_PX  = 500
 
 
@@ -53,9 +52,9 @@ def _null(_): pass   # callback vide obligatoire pour cv2.createTrackbar
 
 def _create_hsv_window(win_name: str, defaults: list):
     """
-    Crée une fenêtre OpenCV avec 6 trackbars H/S/V min/max.
+    Cree une fenetre OpenCV avec 6 trackbars H/S/V min/max.
 
-    :param win_name:  nom de la fenêtre (affiché dans la barre de titre)
+    :param win_name:  nom de la fenetre (affiche dans la barre de titre)
     :param defaults:  liste [H_min, H_max, S_min, S_max, V_min, V_max]
     """
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
@@ -69,8 +68,8 @@ def _create_hsv_window(win_name: str, defaults: list):
 
 def _read_hsv_window(win_name: str):
     """
-    Lit les 6 trackbars d'une fenêtre et retourne (lo, hi) sous forme
-    de np.array prêts pour cv2.inRange.
+    Lit les 6 trackbars d'une fenetre et retourne (lo, hi) sous forme
+    de np.array prets pour cv2.inRange.
     """
     h_min = cv2.getTrackbarPos('H_min', win_name)
     h_max = cv2.getTrackbarPos('H_max', win_name)
@@ -83,7 +82,7 @@ def _read_hsv_window(win_name: str):
     return lo, hi
 
 
-# Noms des fenêtres trackbars (utilisés pour la création ET la lecture)
+# Noms des fenetres trackbars
 WIN_RED1  = "HSV - Rouge arc 1  (teintes basses  0-10)"
 WIN_RED2  = "HSV - Rouge arc 2  (teintes hautes 165-180)"
 WIN_GREEN = "HSV - Vert"
@@ -109,39 +108,37 @@ class LineDetector(Node):
                 Image, '/image_raw',
                 self.listener_callback, 10)
 
-        # Topics multicouches (identiques à l'antérieur)
+        # Topics multicouches on envoie les positions des lignes pour toutes les tranches
         self.pub_red_bands   = self.create_publisher(Int32MultiArray, '/red_bands_cx',    10)
         self.pub_green_bands = self.create_publisher(Int32MultiArray, '/green_bands_cx',  10)
 
-        # Topics legacy
+        # on garde aussi la position la plus proche
         self.pub_red_pos   = self.create_publisher(Int32, '/red_line_pos',   10)
         self.pub_green_pos = self.create_publisher(Int32, '/green_line_pos', 10)
 
-        # Topics ligne bleue et largeur caméra
+        # Topics ligne bleue et largeur camera
         self.pub_blue      = self.create_publisher(Bool,  '/blue_line_crossed', 10)
         self.pub_cam_width = self.create_publisher(Int32, '/camera_width',      10)
 
-        # Topics de débogage visuel
+        # Topics de debogage visuel pour qu'on puisse voir ce que le robot voit sur nos ordis
         self.pub_debug_nette = self.create_publisher(Image, '/debug/vision_nette', 10)
         self.pub_debug_blue  = self.create_publisher(Image, '/debug/mask_blue',    10)
 
-        # Création des fenêtres trackbars HSV
-        # Chaque couleur dispose de sa propre fenêtre avec 6 curseurs.
-        # Les valeurs initiales correspondent aux seuils calibrés de l'antérieur.
+        # on cree nos fenetres de reglage des couleurs (ca prend les valeurs de base qu'on a mis en haut)
         _create_hsv_window(WIN_RED1,  HSV_DEFAULT_RED1)
         _create_hsv_window(WIN_RED2,  HSV_DEFAULT_RED2)
         _create_hsv_window(WIN_GREEN, HSV_DEFAULT_GREEN)
         _create_hsv_window(WIN_BLUE,  HSV_DEFAULT_BLUE)
 
         self.get_logger().info(
-            f"LineDetector démarré — MODE={MODE} | {N_BANDS} bandes "
+            f"LineDetector demarre — MODE={MODE} | {N_BANDS} bandes "
             f"| zone [{ZONE_TOP_FRAC:.0%}–{ZONE_BOT_FRAC:.0%}] "
             f"| trackbars HSV actives"
         )
 
     def listener_callback(self, msg):
 
-        # Décodage de l'image selon le mode
+        # Decodage de l'image selon le mode
         if MODE == "IRL":
             frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
         else:
@@ -157,14 +154,13 @@ class LineDetector(Node):
 
         cv2.imshow("Image Brute", frame)
 
-        # Lecture des seuils HSV depuis les trackbars
-        # Les masques se mettent à jour en temps réel à chaque frame.
+        #on lit les valeurs de nos fenetres a chaque frame pour que ca marche en temps reel si on bouge un curseur
         r_lo1, r_hi1 = _read_hsv_window(WIN_RED1)
         r_lo2, r_hi2 = _read_hsv_window(WIN_RED2)
         g_lo,  g_hi  = _read_hsv_window(WIN_GREEN)
         b_lo,  b_hi  = _read_hsv_window(WIN_BLUE)
 
-        # Construction des masques couleur
+        # on cree les masques (une image en noir et blanc: blanc si c'est la bonne couleur, noir sinon)
         mask_r_full = cv2.bitwise_or(
             cv2.inRange(hsv, r_lo1, r_hi1),
             cv2.inRange(hsv, r_lo2, r_hi2)
@@ -172,12 +168,12 @@ class LineDetector(Node):
         mask_g_full = cv2.inRange(hsv, g_lo, g_hi)
         mask_blue   = cv2.inRange(hsv, b_lo, b_hi)
 
-        # Segmentation en N_BANDS bandes
+        # on decoupe l'image en N_BANDS bandes
         y_start = int(h * ZONE_TOP_FRAC)
         y_end   = int(h * ZONE_BOT_FRAC)
         zone_height = (y_end - y_start) // N_BANDS
 
-        # Détection LIGNE BLEUE restreinte à la bande la plus proche (dernière bande)
+        # Detection LIGNE BLEUE restreinte a la bande la plus proche (derniere bande)
         y_blue_top    = y_start + (N_BANDS - 1) * zone_height
         y_blue_bottom = y_blue_top + zone_height
 
@@ -189,7 +185,7 @@ class LineDetector(Node):
         is_blue_now  = pixels_bleus > BLUE_MIN_PX
 
         if is_blue_now and not self.blue_detected_previously:
-            self.get_logger().info("🔵 Ligne Bleue Détectée !")
+            self.get_logger().info("🔵 Ligne Bleue Detectee !")
             self.pub_blue.publish(Bool(data=True))
 
         self.blue_detected_previously = is_blue_now
@@ -206,7 +202,7 @@ class LineDetector(Node):
             y_top_band = y_start + i * zone_height
             y_bot_band = y_top_band + zone_height
 
-            # Isolation de la bande (copie + effacement hors bande)
+            # on isole chaque tranche en effacant le reste pour trouver le centre de la couleur juste a cet endroit
             mask_r_band = mask_r_full.copy()
             mask_r_band[0:y_top_band, :] = 0
             mask_r_band[y_bot_band:h, :] = 0
@@ -218,7 +214,7 @@ class LineDetector(Node):
             cx_red_bands.append(self._get_cx(mask_r_band, min_area))
             cx_green_bands.append(self._get_cx(mask_g_band, min_area))
 
-        # Publication multicouches
+        # on publie nos N points trouves sur les lignes
         msg_red         = Int32MultiArray()
         msg_red.data    = cx_red_bands
         msg_green       = Int32MultiArray()
@@ -227,19 +223,18 @@ class LineDetector(Node):
         self.pub_red_bands.publish(msg_red)
         self.pub_green_bands.publish(msg_green)
 
-        # Publication legacy (bande la plus proche = indice N-1)
+        # on publie la bande la plus proche = indice N-1 pour le challenge 2
         self.pub_red_pos.publish(Int32(data=cx_red_bands[-1]))
         self.pub_green_pos.publish(Int32(data=cx_green_bands[-1]))
 
-        # Rendu coloré du masque de débogage
-        # Création d'une image BGR vide sur laquelle on colorie :
+        # Creation d'une image BGR vide sur laquelle on colorie :
         #   - pixels rouges  → (0, 0, 255)  BGR rouge
         #   - pixels verts   → (0, 200, 0)  BGR vert
-        #   - pixels bleus   → (255, 50, 0) BGR bleu  (depuis la ROI bleue)
-        # Les séparateurs de bandes sont tracés en blanc.
+        #   - pixels bleus   → (255, 50, 0) BGR bleu
+        # Les separateurs de bandes sont traces en blanc.
         debug_color = np.zeros((h, w, 3), dtype=np.uint8)
 
-        # On restreint l'affichage rouge/vert à la zone analysée
+        # on affiche que la zone qu'on analyse vraiment (la moitie du bas)
         roi_r = np.zeros_like(mask_r_full)
         roi_r[y_start:y_start + zone_height * N_BANDS, :] = \
             mask_r_full[y_start:y_start + zone_height * N_BANDS, :]
@@ -252,15 +247,15 @@ class LineDetector(Node):
         debug_color[roi_g == 255]      = (  0, 200,   0)   # vert
         debug_color[mask_blue_roi == 255] = (255,  50,   0)   # bleu (ROI basse)
 
-        # Séparateurs de bandes (blancs) + numérotation
+        # on dessine les lignes blanches pour separer nos tranches
         for i in range(1, N_BANDS):
             y_sep = y_start + i * zone_height
             cv2.line(debug_color, (0, y_sep), (w, y_sep), (255, 255, 255), 1)
 
-        # Ligne jaune marquant la frontière haute de la zone analysée
+        # la ligne jaune montre ou commence notre vision
         cv2.line(debug_color, (0, y_start), (w, y_start), (0, 255, 255), 2)
 
-        # Numéro de bande (0 = loin, N-1 = proche)
+        # on ecrit le numero de la tranche (0 c'est loin, 4 c'est pres)
         for i in range(N_BANDS):
             y_label = y_start + i * zone_height + zone_height // 2
             cv2.putText(debug_color, str(i), (4, y_label),
@@ -269,7 +264,7 @@ class LineDetector(Node):
         cv2.imshow("Vision du Masque (multicouche)", debug_color)
         cv2.waitKey(1)
 
-        # Publication des images de débogage ROS (mono8 pour la rétrocompatibilité)
+        # Publication des images de debogage ROS
         mask_nette   = cv2.bitwise_or(roi_r, roi_g)
         msg_nette    = self.bridge.cv2_to_imgmsg(mask_nette, encoding="mono8")
         msg_blue_img = self.bridge.cv2_to_imgmsg(mask_blue,  encoding="mono8")
