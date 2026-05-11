@@ -1,153 +1,151 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage, Image, LaserScan
+from sensor_msgs.msg import LaserScan, CompressedImage, Image
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import math
+import time
 
-# =============================================================================
-# MODE
-# =============================================================================
+
 MODE = "IRL"   # "IRL" ou "SIMULATION"
 
-# =============================================================================
-# PHASE 1 — OBSERVATION : paramètres de confirmation
-# =============================================================================
+# ETATS DE LA MACHINE A ETATS (FSM) :
 
-# Nombre de frames consécutives où balle ET but doivent être détectés
-# avant de figer la scène et passer en planification.
-# Plus la valeur est haute, plus la mesure est stable mais lente.
-OBS_CONFIRM_FRAMES = 15   # frames — ↑ = plus stable, ↓ = plus rapide
+STATE_SEARCH_BALL          = 'SEARCH_BALL'
+STATE_MEMORIZE_BALL        = 'MEMORIZE_BALL'
+STATE_SEARCH_GOAL          = 'SEARCH_GOAL'
+STATE_COMPUTE_TRAJECTORY   = 'COMPUTE_TRAJECTORY'
+STATE_NAVIGATE_TO_WAYPOINT = 'NAVIGATE_TO_WAYPOINT'
+STATE_ALIGN_AND_PUSH       = 'ALIGN_AND_PUSH'
+# etat final quand on a marque, on bloque le robot
+STATE_DONE                 = 'DONE'
 
-# Durée (en secondes) pendant laquelle la balle peut être absente en OBSERVE
-# avant de retourner en SCAN. Évite qu'une seule frame de bruit relance la rotation.
-BALL_LOST_TIMEOUT = 1.5   # s — ↑ = plus tolérant au bruit, ↓ = réagit plus vite
-
-# Distance max de la balle acceptée en observation (évite les confusions lointaines)
-OBS_BALL_MAX_DIST = 2.5   # m  (estimée depuis le rayon pixel + focale approx.)
-
-# Vitesse de rotation pendant la recherche (SCAN)
-SEARCH_OMEGA     = 0.40   # rad/s
-SEARCH_MAX_ANGLE = math.radians(90)   # balayage ±90°
-
-# =============================================================================
-# PHASE 2 — PLANIFICATION : géométrie du waypoint
-# =============================================================================
-
-# Distance derrière la balle (sur l'axe But→Balle) où le robot doit se placer
-# avant de pousser. Plus c'est grand, plus l'alignement est précis mais long.
-APPROACH_DIST = 0.35   # m  — ↑ = plus de recul, ↓ = approche plus directe
-
-# Rayon de la balle de tennis (~6.5 cm) — utilisé pour estimer la distance balle
-# depuis le LIDAR (le LIDAR mesure la surface de la balle, pas son centre)
-BALL_RADIUS_M = 0.033   # m  (rayon réel ≈ 3.3 cm)
-
-# Distance focale estimée de la caméra TurtleBot3 (en pixels).
-# Utilisée pour convertir le rayon pixel → distance métrique.
-# f_px ≈ f_mm * (résolution_px / taille_capteur_mm)
-# Valeur par défaut pour la caméra 160° grand-angle du TurtleBot3 :
-# À calibrer si possible (ros2 run camera_calibration cameracalibrator)
-CAMERA_FOCAL_PX = 280.0   # px — ↑ = caméra téléobjectif, ↓ = grand-angle
-
-# Facteur de correction empirique de la distance balle.
-# La formule optique seule (CAMERA_FOCAL_PX) est souvent imprécise IRL.
-# Ce multiplicateur ajuste la distance estimée sans toucher au paramètre physique.
-#   = 1.0 → pas de correction
-#   > 1.0 → robot pense que la balle est plus loin (à augmenter si trop proche)
-#   < 1.0 → robot pense que la balle est plus près
-# Méthode : regarder la distance affichée en vert dans la fenêtre debug,
-# mesurer la vraie distance avec un mètre, puis :
-#   BALL_DIST_SCALE = distance_réelle / distance_affichée
-BALL_DIST_SCALE = 1.0   # ← ajuster ici jusqu'à ce que l'affichage soit correct
-
-# =============================================================================
-# PHASE 3 — EXÉCUTION : contrôle de navigation
-# =============================================================================
-
-# --- Sous-phase GOTO_WAYPOINT : aller au point d'approche ---
-# Tolérance de position pour considérer le waypoint atteint
-GOTO_POS_TOL   = 0.08   # m  — ↑ = s'arrête plus loin du waypoint
-# Gain proportionnel angulaire pendant la navigation vers le waypoint
-GOTO_KP_ANG    = 1.8    # rad/s par rad d'erreur
-# Vitesse de navigation (réduite si virage serré)
-GOTO_SPEED_MAX = 0.12   # m/s
-GOTO_SPEED_MIN = 0.04   # m/s
-
-# --- Sous-phase FACE_GOAL : pivoter pour faire face au but ---
-# Tolérance angulaire pour considérer l'alignement atteint
-FACE_TOL = math.radians(5)   # rad — ↑ = alignement plus approximatif
-# Gain proportionnel de rotation sur place
-FACE_KP   = 1.5
-
-# --- Sous-phase PUSH : avancer pour pousser la balle ---
-# Distance totale à parcourir pendant la poussée
-# = distance robot→balle estimée + marge pour traverser le but
-PUSH_EXTRA_DIST = 0.30   # m  — ↑ = pousse plus loin après la balle
-PUSH_SPEED      = 0.14   # m/s — vitesse de poussée (ne pas dépasser 0.20)
-# Sécurité : si le LIDAR voit un obstacle inattendu à moins de X m, on stoppe
-PUSH_STOP_DIST  = 0.08   # m
-
-# =============================================================================
-# PARAMÈTRES BALLE — détection vision
-# =============================================================================
-BALL_HSV = dict(H_min=22, H_max=48, S_min=60, S_max=255, V_min=100, V_max=255)
-
-BALL_CIRCULARITY_MIN = 0.65
-BALL_RADIUS_MIN      = 10    # px
-BALL_RADIUS_MAX      = 150   # px
-# Pas de ROI : on analyse l'image entière pour ne pas rater la balle
-
-# =============================================================================
-# PARAMÈTRES CAGE — détection LIDAR
-# =============================================================================
-GOAL_HALF_ANGLE     = math.radians(90)
-GOAL_GAP_MIN        = 0.35   # m
-GOAL_GAP_MAX        = 0.45   # m
-GOAL_POST_MAX_WIDTH = 0.10   # m
-GOAL_MAX_DIST       = 2.5    # m
-GOAL_POST_MIN_PTS   = 2
-GOAL_POST_MAX_PTS   = 12
-LIDAR_CLUSTER_GAP   = 0.10   # m
-LIDAR_MIN_VALID     = 0.12   # m — filtre les 0.0 du firmware TurtleBot3
-
-# =============================================================================
-# ÉTATS DE LA MACHINE
-# =============================================================================
-# Phase 1 — Observation
-STATE_SCAN    = "SCAN"       # tourne pour trouver balle + but
-STATE_OBSERVE = "OBSERVE"    # accumule les mesures pour les stabiliser
-
-# Phase 2 — Planification (instantanée, pas d'état dédié — transition directe)
-
-# Phase 3 — Exécution
-STATE_GOTO    = "GOTO"       # navigue vers le waypoint d'approche
-STATE_FACE    = "FACE"       # pivote pour faire face au but
-STATE_PUSH    = "PUSH"       # avance et pousse la balle
-STATE_DONE    = "DONE"       # tir terminé
-
-WIN_DEBUG = "Challenge 4 — Debug"
-WIN_TUNER = "Challenge 4 — Tuner Balle HSV"
-
-def _null(_): pass
-
-def _angle_diff(a, b):
-    """Différence angulaire normalisée dans [-π, π]."""
-    d = a - b
-    while d >  math.pi: d -= 2 * math.pi
-    while d < -math.pi: d += 2 * math.pi
-    return d
-
-def _yaw_from_quat(q):
-    siny = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny, cosy)
+# on regroupe les etats de la phase 2 (quand on a deja lock la balle)
+POST_MEMO_STATES = {
+    STATE_SEARCH_GOAL,
+    STATE_COMPUTE_TRAJECTORY,
+    STATE_NAVIGATE_TO_WAYPOINT,
+    STATE_ALIGN_AND_PUSH,
+    STATE_DONE,
+}
 
 
 # =============================================================================
-# NŒUD PRINCIPAL
+# PARAMETRES PAR DEFAUT
+# =============================================================================
+
+# -- Couleurs balle (jaune/vert) -----------------------------------------
+if MODE == "IRL":
+    HSV_BALL = [20, 50, 60, 255, 60, 255]
+else:
+    HSV_BALL = [28, 65, 80, 255, 60, 255]
+
+BALL_MIN_AREA     = 400      # taille mini du blob pour pas prendre un pixel au pif
+
+# -- Couleurs poteaux (rouge) -------------------------------------------
+if MODE == "IRL":
+    HSV_RED1 = [  0,  10,  50, 255,  50, 255]
+    HSV_RED2 = [160, 180,  50, 255,  50, 255]
+else:
+    HSV_RED1 = [  0,  10, 100, 255,  80, 255]
+    HSV_RED2 = [160, 180, 100, 255,  80, 255]
+
+POST_MIN_AREA     = 300      
+POST_ASPECT_MIN   = 1.5      # on s'assure que c'est un rectangle vertical (hauteur > largeur)
+
+# -- PD pour centrer la vision --------------------------------
+ANG_KP            = 3.5
+ANG_KD            = 1.0
+ALPHA_FILT        = 0.70
+
+# -- PID pour aller au waypoint -------------------------------
+NAV_ANG_KP        = 2.0      # correction pour s'aligner vers le point
+NAV_ANG_KI        = 0.02     
+NAV_ANG_KD        = 0.5      
+NAV_LIN_KP        = 0.6      # correction pour avancer
+NAV_LIN_MAX       = 0.12     # on bride un peu la vitesse max
+NAV_LIN_MIN       = 0.03     
+NAV_ARRIVAL_DIST  = 0.12     # a quelle distance on considere qu'on est arrive
+
+# -- Vitesses de base -------------------------------------------------------
+SEARCH_OMEGA      = 0.35     # vitesse quand il tourne sur lui meme
+PUSH_V            = 0.10     # vitesse quand il fonce dans la balle
+OMEGA_MAX         = 1.4      
+
+# -- Validations -------------------------------------------------------
+BALL_STABLE_FRAMES = 8       # nb de frames ok de suite avant de valider la balle
+BALL_STABLE_TOL   = 0.04     # tolerance pour considerer qu'on est bien centre
+BLIND_SPOT_FRAMES = 4        
+
+# -- Bidouilles pour estimer les distances sans laser -------------------------
+# formule optique de base avec la focale
+BALL_REAL_DIAM_M  = 0.065    
+CAMERA_FOCAL_EST  = 530.0    
+CAMERA_FOV_RAD    = math.radians(60)
+
+# on corrige le laser parce qu'il tape sur le bord des objets et pas au centre
+DIST_OFFSET       = 0.45     
+
+# -- Distances de calcul ----------------------------------------------------
+WAYPOINT_OFFSET   = 0.20     # on se place a 20cm derriere la balle pour preparer le tir
+
+# -- Secu --------------------------------------------------------
+SAFETY_DIST       = 0.17     # si mur trop pres on stop
+PUSH_TIMEOUT      = 30.0     # au bout de 30s de poussee on abandonne
+NAV_TIMEOUT       = 30.0     
+
+# -- Point final (End Point) --------------------------------------------------
+# on pousse la balle 30cm au dela de la ligne de but pour etre sur
+PUSH_OVERSHOOT    = 0.30     
+
+# -- Filtres laser pour les poteaux --------------------------------------------------
+LIDAR_MAX_RANGE   = 2.0
+CLUSTER_GAP       = 0.15
+CLUSTER_MIN_PTS   = 3
+POST_WIDTH_MAX    = 0.12
+GOAL_DIST_MIN     = 0.35
+GOAL_DIST_MAX     = 1.30
+
+# -- Validation vision cage ----------------------------------------------------------
+CONFIRM_FRAMES    = 2        
+
+# -- Balayage ----------------------------------------------------
+# on regarde que devant (allers-retours de 90 degres de chaque cote)
+SWEEP_HALF_ANGLE  = math.pi / 2.0   
+
+
+# =============================================================================
+# OUTILS MATHS
+# =============================================================================
+
+def normalize_angle(a: float) -> float:
+    # remet l'angle proprement entre -pi et pi
+    while a >  math.pi: a -= 2 * math.pi
+    while a < -math.pi: a += 2 * math.pi
+    return a
+
+def robot_to_world(rx: float, ry: float, ryaw: float,
+                   lx: float, ly: float) -> tuple:
+    # convertit les coordonnees du robot (relatif) en coordonnees map (odom)
+    cos_y = math.cos(ryaw)
+    sin_y = math.sin(ryaw)
+    wx = rx + cos_y * lx - sin_y * ly
+    wy = ry + sin_y * lx + cos_y * ly
+    return wx, wy
+
+def polar_to_local(dist: float, angle_rad: float) -> tuple:
+    # convertit angle+distance du capteur en x,y par rapport au robot
+    return dist * math.cos(angle_rad), dist * math.sin(angle_rad)
+
+def dist2d(ax: float, ay: float, bx: float, by: float) -> float:
+    return math.sqrt((ax - bx)**2 + (ay - by)**2)
+
+
+# =============================================================================
+# LE NOEUD PRINCIPAL
 # =============================================================================
 
 class Challenge4(Node):
@@ -155,631 +153,959 @@ class Challenge4(Node):
     def __init__(self):
         super().__init__('challenge4')
 
-        # ── Publications ──────────────────────────────────────────────────────
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel_challenge_4', 10)
-        self.bridge  = CvBridge()
+        if MODE not in ("IRL", "SIMULATION"):
+            raise ValueError(f"MODE invalide : '{MODE}'. Choisir 'IRL' ou 'SIMULATION'.")
 
-        # ── Abonnements ───────────────────────────────────────────────────────
+        # on setup nos parametres ros2 pour pouvoir tuner sans relancer le code
+        self.declare_parameter('ball_h_min',        float(HSV_BALL[0]))
+        self.declare_parameter('ball_h_max',        float(HSV_BALL[1]))
+        self.declare_parameter('ball_s_min',        float(HSV_BALL[2]))
+        self.declare_parameter('ball_s_max',        float(HSV_BALL[3]))
+        self.declare_parameter('ball_v_min',        float(HSV_BALL[4]))
+        self.declare_parameter('ball_v_max',        float(HSV_BALL[5]))
+        self.declare_parameter('ball_min_area',     float(BALL_MIN_AREA))
+        
+        self.declare_parameter('red1_h_min',        float(HSV_RED1[0]))
+        self.declare_parameter('red1_h_max',        float(HSV_RED1[1]))
+        self.declare_parameter('red1_s_min',        float(HSV_RED1[2]))
+        self.declare_parameter('red2_h_min',        float(HSV_RED2[0]))
+        self.declare_parameter('red2_h_max',        float(HSV_RED2[1]))
+        self.declare_parameter('red2_s_min',        float(HSV_RED2[2]))
+        self.declare_parameter('post_min_area',     float(POST_MIN_AREA))
+        self.declare_parameter('post_aspect_min',   float(POST_ASPECT_MIN))
+        
+        self.declare_parameter('ang_kp',            float(ANG_KP))
+        self.declare_parameter('ang_kd',            float(ANG_KD))
+        self.declare_parameter('nav_ang_kp',        float(NAV_ANG_KP))
+        self.declare_parameter('nav_ang_ki',        float(NAV_ANG_KI))
+        self.declare_parameter('nav_ang_kd',        float(NAV_ANG_KD))
+        self.declare_parameter('nav_lin_kp',        float(NAV_LIN_KP))
+        self.declare_parameter('nav_lin_max',       float(NAV_LIN_MAX))
+        self.declare_parameter('nav_arrival_dist',  float(NAV_ARRIVAL_DIST))
+        
+        self.declare_parameter('search_omega',      float(SEARCH_OMEGA))
+        self.declare_parameter('push_v',            float(PUSH_V))
+        self.declare_parameter('omega_max',         float(OMEGA_MAX))
+        
+        self.declare_parameter('waypoint_offset',   float(WAYPOINT_OFFSET))
+        
+        self.declare_parameter('align_err_thresh',  float(BALL_STABLE_TOL))
+        self.declare_parameter('align_frames_ok',   int(BALL_STABLE_FRAMES))
+        self.declare_parameter('confirm_frames',    int(CONFIRM_FRAMES))
+        self.declare_parameter('safety_dist',       float(SAFETY_DIST))
+        self.declare_parameter('push_timeout',      float(PUSH_TIMEOUT))
+        self.declare_parameter('nav_timeout',       float(NAV_TIMEOUT))
+        self.declare_parameter('goal_dist_min',     float(GOAL_DIST_MIN))
+        self.declare_parameter('goal_dist_max',     float(GOAL_DIST_MAX))
+        
+        self.declare_parameter('push_overshoot',    float(PUSH_OVERSHOOT))
+        self.declare_parameter('dist_offset',       float(DIST_OFFSET))
+
+        self.bridge = CvBridge()
+
+        # on start direct sur la recherche
+        self.state = STATE_SEARCH_BALL
+
+        self.laserscan    = None
+        self.image_width  = 640.0
+        self.image_height = 480.0
+
+        # odometrie 
+        self.robot_x   = 0.0    
+        self.robot_y   = 0.0    
+        self.robot_yaw = 0.0    
+        self.odom_ok   = False  
+
+        # sert pour le scan a 180 degres (on bloque la direction initiale)
+        self.yaw_initial   = None   
+        self.sweep_direction = -1.0  
+
+        # verrou quand on a trouve la balle pour arreter de faire chauffer le cpu
+        self.ball_locked = False
+
+        # memoire balle
+        self.ball_dist  = 0.30    
+        self.ball_angle = 0.0     
+        self.ball_cx    = 320     
+        self.ball_world_x = None  
+        self.ball_world_y = None  
+        self.stable_frames = 0
+
+        # memoire cage
+        self.goal_world_x  = None  
+        self.goal_world_y  = None  
+        self.goal_cx_vision = self.image_width / 2.0  
+        self.confirm_frames_count = 0
+
+        # le fameux point ou on doit se placer pour tirer
+        self.waypoint_x = None    
+        self.waypoint_y = None    
+
+        # la ligne d'arrivee
+        self.end_point_x = None   
+        self.end_point_y = None   
+
+        # vecteur pour pousser tout droit
+        self.push_vx = 1.0    
+        self.push_vy = 0.0    
+
+        # variables pour nos pids
+        self.err_ang_prev  = 0.0
+        self.err_ang_filt  = 0.0
+        self.frames_aligned = 0
+        self.blind_frames  = 0
+
+        self.nav_err_prev     = 0.0
+        self.nav_err_integral = 0.0
+        self.nav_t_prev       = 0.0
+
+        # chronos
+        self.push_start_time  = 0.0
+        self.nav_start_time   = 0.0
+
+        self.cmd_pending = Twist()
+
+        # topics
+        self.create_subscription(LaserScan, '/scan', self.cb_scan, 10)
+        self.create_subscription(Odometry,  '/odom', self.cb_odom, 10)
+        
         if MODE == "IRL":
-            self.create_subscription(
-                CompressedImage, '/camera/image_raw/compressed',
-                self._img_cb, 10)
+            self.create_subscription(CompressedImage, '/camera/image_raw/compressed', self.cb_image, 10)
         else:
-            self.create_subscription(Image, '/image_raw', self._img_cb_raw, 10)
+            self.create_subscription(Image, '/image_raw', self.cb_image, 10)
 
-        self.create_subscription(LaserScan, '/scan',  self._scan_cb, 10)
-        self.create_subscription(Odometry,  '/odom',  self._odom_cb, 10)
+        self.pub_cmd   = self.create_publisher(Twist, '/cmd_vel_challenge_4', 10)
+        self.pub_debug = self.create_publisher(Image, '/debug/challenge4',    10)
+        self.create_timer(0.05, self._publish_cmd)   
 
-        # ── Données capteurs brutes ───────────────────────────────────────────
-        # Vision balle
-        self.ball_cx     = -1
-        self.ball_cy     = -1
-        self.ball_radius = 0
-        self.img_w       = 640
-        self.img_h       = 480
-
-        # LIDAR cage
-        self.goal_angle    = None    # angle vers le milieu du but (rad, ROS: + = gauche)
-        self.goal_dist     = None    # distance estimée jusqu'au milieu du but (m)
-        self.goal_detected = False
-
-        # LIDAR distance frontale
-        self.front_dist = 9.0
-
-        # Odométrie
-        self.odom_x   = None   # position x (m)
-        self.odom_y   = None   # position y (m)
-        self.odom_yaw = None   # cap (rad)
-
-        # ── Phase 1 : buffers d'observation ───────────────────────────────────
-        # On accumule les mesures de balle (angle vision) et de but (angle LIDAR)
-        # sur OBS_CONFIRM_FRAMES frames consécutives valides.
-        self._obs_ball_angles = []   # angles balle dans image (rad depuis axe optique)
-        self._obs_ball_dists  = []   # distances balle estimées (m)
-        self._obs_goal_angles = []   # angles but LIDAR (rad)
-        self._obs_goal_dists  = []   # distances but LIDAR (m)
-        self._obs_frames      = 0    # compteur de frames valides consécutives
-
-        # ── Phase 2 : plan calculé ────────────────────────────────────────────
-        # Toutes les coordonnées sont dans le repère MONDE (frame odom)
-        self.plan_ball_x    = None   # position estimée balle (m, monde)
-        self.plan_ball_y    = None
-        self.plan_goal_x    = None   # position estimée but (m, monde)
-        self.plan_goal_y    = None
-        self.plan_wp_x      = None   # waypoint d'approche (m, monde)
-        self.plan_wp_y      = None
-        self.plan_face_yaw  = None   # cap à tenir pendant la poussée (rad, monde)
-        self.plan_push_dist = None   # distance totale à parcourir en poussée (m)
-
-        # ── Phase 3 : état d'exécution ────────────────────────────────────────
-        self._push_start_x  = None   # position x au début de la poussée
-        self._push_start_y  = None   # position y au début de la poussée
-        self._push_dist_done = 0.0   # distance parcourue depuis le début de la poussée
-
-        # ── Machine à états ───────────────────────────────────────────────────
-        self.state      = STATE_SCAN
-        self._scan_dir  = 1.0
-        self._scan_cum  = 0.0
-
-        # Horodatage de la dernière frame où la balle était visible.
-        # En OBSERVE, on ne retourne en SCAN que si la balle est absente
-        # pendant plus de BALL_LOST_TIMEOUT secondes consécutives.
-        # Cela évite qu'une seule frame manquante relance la rotation.
-        self._last_ball_seen = None   # initialisé au premier tick
-
-        # ── Fenêtres OpenCV ───────────────────────────────────────────────────
-        cv2.namedWindow(WIN_DEBUG, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WIN_DEBUG, 1000, 480)
-        cv2.namedWindow(WIN_TUNER, cv2.WINDOW_NORMAL)
-        for name, val, mx in [
-            ('H_min', BALL_HSV['H_min'], 179), ('H_max', BALL_HSV['H_max'], 179),
-            ('S_min', BALL_HSV['S_min'], 255), ('S_max', BALL_HSV['S_max'], 255),
-            ('V_min', BALL_HSV['V_min'], 255), ('V_max', BALL_HSV['V_max'], 255),
-        ]:
-            cv2.createTrackbar(name, WIN_TUNER, val, mx, _null)
-
-        self.create_timer(0.05, self._control_loop)
-        self.get_logger().info(f"Challenge4 — Observer/Planifier/Exécuter [MODE={MODE}]")
+        self.get_logger().info("Challenge 4 pret.")
 
     # =========================================================================
-    # CALLBACKS CAPTEURS
+    # Callbacks capteurs
     # =========================================================================
 
-    def _img_cb(self, msg):
-        self._process(self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8'))
+    def cb_scan(self, msg: LaserScan):
+        # on coupe tout ce qui est derriere le robot pour pas etre gene
+        r = np.asarray(msg.ranges, dtype=np.float32)
+        r = np.where(np.isinf(r) | np.isnan(r) | (r == 0.0), 3.5, r)
+        r = np.clip(r, 0.0, 3.5)
+        r[91:270] = 3.5
+        self.laserscan = r
 
-    def _img_cb_raw(self, msg):
-        self._process(self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8'))
+    def cb_odom(self, msg: Odometry):
+        # maj de notre position absolue sur la carte
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
 
-    def _odom_cb(self, msg):
-        p = msg.pose.pose
-        self.odom_x   = p.position.x
-        self.odom_y   = p.position.y
-        self.odom_yaw = _yaw_from_quat(p.orientation)
-
-    def _scan_cb(self, msg):
-        ranges = np.array(msg.ranges, dtype=np.float32)
-        invalid = (~np.isfinite(ranges)) | (ranges < LIDAR_MIN_VALID)
-        ranges[invalid] = 9.0
-
-        front = np.concatenate((ranges[:30], ranges[-30:]))
-        self.front_dist = float(np.min(front))
-
-        angle, dist, detected = self._find_goal(ranges, msg.angle_min, msg.angle_increment)
-        self.goal_angle    = angle
-        self.goal_dist     = dist
-        self.goal_detected = detected
-
-    # =========================================================================
-    # TRAITEMENT IMAGE
-    # =========================================================================
-
-    def _process(self, frame):
-        h, w = frame.shape[:2]
-        self.img_w, self.img_h = w, h
-
-        lo = np.array([cv2.getTrackbarPos('H_min', WIN_TUNER),
-                       cv2.getTrackbarPos('S_min', WIN_TUNER),
-                       cv2.getTrackbarPos('V_min', WIN_TUNER)], dtype=np.uint8)
-        hi = np.array([cv2.getTrackbarPos('H_max', WIN_TUNER),
-                       cv2.getTrackbarPos('S_max', WIN_TUNER),
-                       cv2.getTrackbarPos('V_max', WIN_TUNER)], dtype=np.uint8)
-
-        # Image entière — pas de ROI restrictive
-        hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask  = cv2.inRange(hsv, lo, hi)
-        ker   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask  = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  ker)
-        mask  = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker)
-
-        cx, cy, radius = self._detect_ball(mask)
-        if cx != -1:
-            self.ball_cx     = cx
-            self.ball_cy     = cy   # pas de décalage ROI
-            self.ball_radius = radius
-            self._last_ball_seen = self.get_clock().now()   # horodatage dernière détection
-        else:
-            self.ball_cx = self.ball_cy = -1
-            self.ball_radius = 0
-
-        self._draw_debug(frame, mask)
-
-    # =========================================================================
-    # DÉTECTION BALLE PAR CIRCULARITÉ
-    # =========================================================================
-
-    def _detect_ball(self, mask):
-        """C = 4π·A/P²  → retourne (cx, cy, rayon) dans le repère de mask, ou (-1,-1,0)"""
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best_r, best = -1, (-1, -1, 0)
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < math.pi * BALL_RADIUS_MIN**2:
-                continue
-            peri = cv2.arcLength(cnt, True)
-            if peri < 1.0:
-                continue
-            if 12.566 * area / (peri * peri) < BALL_CIRCULARITY_MIN:
-                continue
-            _, radius = cv2.minEnclosingCircle(cnt)
-            radius = int(radius)
-            if not (BALL_RADIUS_MIN <= radius <= BALL_RADIUS_MAX):
-                continue
-            if radius > best_r:
-                best_r = radius
-                M  = cv2.moments(cnt)
-                cx = int(M['m10'] / M['m00']) if M['m00'] > 0 else int(cnt[0][0][0])
-                cy = int(M['m01'] / M['m00']) if M['m00'] > 0 else int(cnt[0][0][1])
-                best = (cx, cy, radius)
-        return best
-
-    def _ball_pixel_to_angle_dist(self):
-        """
-        Convertit la détection pixel de la balle en (angle_rad, distance_m)
-        dans le repère robot.
-
-        Angle horizontal :
-            angle = atan2( (cx - w/2) , f_px )
-            Positif = balle à droite de l'axe optique.
-            Convention ROS : on l'inverse → positif = gauche.
-
-        Distance estimée :
-            d = (BALL_RADIUS_M * CAMERA_FOCAL_PX) / ball_radius_px
-            C'est la formule de la taille angulaire apparente (thin-lens).
-            Précision ±20 % sans calibration — suffisant pour le waypoint.
-        """
-        if self.ball_cx == -1 or self.ball_radius == 0:
-            return None, None
-
-        cx_centered = self.ball_cx - self.img_w / 2.0
-        # Angle depuis l'axe optique (positif = droite dans l'image = droite du robot)
-        # On l'inverse pour la convention ROS (positif = gauche)
-        angle = -math.atan2(cx_centered, CAMERA_FOCAL_PX)
-
-        # Distance par similitude de triangles, corrigée par BALL_DIST_SCALE
-        dist = (BALL_RADIUS_M * CAMERA_FOCAL_PX) / max(self.ball_radius, 1)
-        dist = dist * BALL_DIST_SCALE          # ← correction empirique terrain
-        dist = min(dist, OBS_BALL_MAX_DIST)
-
-        return angle, dist
-
-    # =========================================================================
-    # DÉTECTION CAGE PAR LIDAR — retourne aussi la distance
-    # =========================================================================
-
-    def _find_goal(self, ranges, angle_min, angle_inc):
-        """
-        Cherche deux pieds de chaise dans le demi-cercle frontal.
-        Retourne (angle_milieu, distance_milieu, True) ou (None, None, False).
-        """
-        pts = []
-        for i, r in enumerate(ranges):
-            if r > GOAL_MAX_DIST:
-                continue
-            angle = angle_min + i * angle_inc
-            angle = (angle + math.pi) % (2 * math.pi) - math.pi
-            if abs(angle) > GOAL_HALF_ANGLE:
-                continue
-            pts.append((angle, r, r * math.cos(angle), r * math.sin(angle)))
-
-        if len(pts) < 4:
-            return None, None, False
-
-        pts.sort(key=lambda p: p[0])
-        clusters, cur = [], [pts[0]]
-        for i in range(1, len(pts)):
-            prev, curr = cur[-1], pts[i]
-            da = curr[0] - prev[0]
-            d  = math.sqrt(prev[1]**2 + curr[1]**2 - 2*prev[1]*curr[1]*math.cos(da))
-            if d > LIDAR_CLUSTER_GAP:
-                if len(cur) >= GOAL_POST_MIN_PTS:
-                    clusters.append(cur)
-                cur = [curr]
-            else:
-                cur.append(curr)
-        if len(cur) >= GOAL_POST_MIN_PTS:
-            clusters.append(cur)
-
-        if len(clusters) < 2:
-            return None, None, False
-
-        def centroid(cl):
-            xs = [p[2] for p in cl]
-            ys = [p[3] for p in cl]
-            cx, cy = sum(xs)/len(xs), sum(ys)/len(ys)
-            width  = math.sqrt((max(xs)-min(xs))**2 + (max(ys)-min(ys))**2)
-            return cx, cy, width
-
-        posts = []
-        for cl in clusters:
-            if GOAL_POST_MIN_PTS <= len(cl) <= GOAL_POST_MAX_PTS:
-                cx, cy, w = centroid(cl)
-                if w <= GOAL_POST_MAX_WIDTH:
-                    posts.append((cx, cy))
-
-        if len(posts) < 2:
-            return None, None, False
-
-        best_angle, best_dist, best_score = None, None, float('inf')
-        for i in range(len(posts)):
-            for j in range(i+1, len(posts)):
-                cx1, cy1 = posts[i]
-                cx2, cy2 = posts[j]
-                gap = math.sqrt((cx1-cx2)**2 + (cy1-cy2)**2)
-                if not (GOAL_GAP_MIN <= gap <= GOAL_GAP_MAX):
-                    continue
-                mid_x = (cx1+cx2) / 2.0
-                mid_y = (cy1+cy2) / 2.0
-                mid_angle = math.atan2(mid_y, mid_x)
-                mid_dist  = math.sqrt(mid_x**2 + mid_y**2)
-                if abs(mid_angle) < best_score:
-                    best_score = abs(mid_angle)
-                    best_angle = mid_angle
-                    best_dist  = mid_dist
-
-        if best_angle is None:
-            return None, None, False
-        return best_angle, best_dist, True
-
-    # =========================================================================
-    # PHASE 2 : CALCUL DU PLAN GÉOMÉTRIQUE
-    # =========================================================================
-
-    def _compute_plan(self):
-        """
-        Calcule le waypoint d'approche et le cap de poussée à partir des
-        positions moyennes observées de la balle et du but.
-
-        Repère de travail : MONDE (frame odom), avec :
-            x_monde = odom_x + dist * cos(odom_yaw + angle_relatif)
-            y_monde = odom_y + dist * sin(odom_yaw + angle_relatif)
-
-        Schéma :
-                        [BUT]
-                          ↑
-                    vecteur de poussée
-                          |
-                        [BALLE]
-                          |
-                    ← APPROACH_DIST →
-                          |
-                      [WAYPOINT]   ← robot s'y rend d'abord
-
-        Calcul du waypoint :
-            vec_but_balle = balle - but   (vecteur unitaire)
-            waypoint = balle + vec_but_balle * APPROACH_DIST
-
-        Le robot, depuis le waypoint, fait face au but en calculant :
-            cap_poussée = atan2(but_y - wp_y, but_x - wp_x)
-        """
-        if self.odom_x is None:
-            return False
-
-        # Moyennes des observations
-        ball_angle_mean = sum(self._obs_ball_angles) / len(self._obs_ball_angles)
-        ball_dist_mean  = sum(self._obs_ball_dists)  / len(self._obs_ball_dists)
-        goal_angle_mean = sum(self._obs_goal_angles) / len(self._obs_goal_angles)
-        goal_dist_mean  = sum(self._obs_goal_dists)  / len(self._obs_goal_dists)
-
-        rob_x   = self.odom_x
-        rob_y   = self.odom_y
-        rob_yaw = self.odom_yaw
-
-        # Conversion polaire → cartésien MONDE
-        # angle_relatif est dans le repère robot (convention ROS : + = gauche)
-        # → dans le repère monde : x_monde += dist*cos(yaw + angle), y += dist*sin(...)
-        ball_world_x = rob_x + ball_dist_mean * math.cos(rob_yaw + ball_angle_mean)
-        ball_world_y = rob_y + ball_dist_mean * math.sin(rob_yaw + ball_angle_mean)
-
-        goal_world_x = rob_x + goal_dist_mean * math.cos(rob_yaw + goal_angle_mean)
-        goal_world_y = rob_y + goal_dist_mean * math.sin(rob_yaw + goal_angle_mean)
-
-        # Vecteur unitaire du but vers la balle (axe de poussée)
-        dx = ball_world_x - goal_world_x
-        dy = ball_world_y - goal_world_y
-        norm = math.sqrt(dx**2 + dy**2)
-        if norm < 0.05:
-            self.get_logger().warn("Plan: but et balle trop proches, abandon.")
-            return False
-
-        ux = dx / norm   # composante unitaire x de l'axe But→Balle
-        uy = dy / norm   # composante unitaire y
-
-        # Waypoint = balle + vecteur unitaire * APPROACH_DIST
-        # (on recule APPROACH_DIST derrière la balle, dans la direction opposée au but)
-        wp_x = ball_world_x + ux * APPROACH_DIST
-        wp_y = ball_world_y + uy * APPROACH_DIST
-
-        # Cap de poussée = direction du waypoint vers le but
-        # (= direction opposée au vecteur unitaire, soit l'angle de -ux, -uy)
-        face_yaw = math.atan2(-uy, -ux)
-
-        # Distance de poussée = distance waypoint→balle + marge supplémentaire
-        # = APPROACH_DIST (par construction) + PUSH_EXTRA_DIST
-        push_dist = APPROACH_DIST + PUSH_EXTRA_DIST
-
-        # Enregistrement du plan
-        self.plan_ball_x   = ball_world_x
-        self.plan_ball_y   = ball_world_y
-        self.plan_goal_x   = goal_world_x
-        self.plan_goal_y   = goal_world_y
-        self.plan_wp_x     = wp_x
-        self.plan_wp_y     = wp_y
-        self.plan_face_yaw = face_yaw
-        self.plan_push_dist = push_dist
-
-        self.get_logger().info(
-            f"[PLAN] balle=({ball_world_x:.2f},{ball_world_y:.2f})m  "
-            f"but=({goal_world_x:.2f},{goal_world_y:.2f})m  "
-            f"wp=({wp_x:.2f},{wp_y:.2f})m  "
-            f"cap={math.degrees(face_yaw):.1f}°  "
-            f"pousse={push_dist:.2f}m"
+        q = msg.pose.pose.orientation
+        # passage quaternion en angle d'euler
+        self.robot_yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         )
-        return True
+        self.odom_ok = True
 
-    # =========================================================================
-    # FENÊTRE DE DEBUG
-    # =========================================================================
+        # on garde notre angle de depart pour le balayage
+        if self.yaw_initial is None:
+            self.yaw_initial = self.robot_yaw
 
-    def _draw_debug(self, frame, mask):
-        h, w = frame.shape[:2]
-        debug = frame.copy()
+    def cb_image(self, msg):
+        # boucle principale qui va appeler la machine a etat
+        try:
+            if MODE == "IRL":
+                frame = self.bridge.compressed_imgmsg_to_cv2(msg, 'bgr8')
+            else:
+                frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception:
+            return
 
-        cv2.line(debug, (w//2, 0), (w//2, h), (80, 80, 80), 1)
+        self.image_height, self.image_width, _ = frame.shape
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # Balle
-        if self.ball_cx != -1:
-            cv2.circle(debug, (self.ball_cx, self.ball_cy), self.ball_radius,
-                       (0, 255, 80), 2)
-            cv2.drawMarker(debug, (self.ball_cx, self.ball_cy),
-                           (0, 255, 80), cv2.MARKER_CROSS, 18, 2)
-            # Affichage distance estimée
-            _, bd = self._ball_pixel_to_angle_dist()
-            if bd:
-                cv2.putText(debug, f"{bd:.2f}m",
-                            (self.ball_cx + self.ball_radius + 4, self.ball_cy),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 80), 1)
+        # si on a pas encore lock la balle on continue de la chercher
+        if not self.ball_locked:
+            ball_data = self._detect_ball(hsv)
+            if ball_data is not None:
+                self._refresh_ball_memory(ball_data)
+                self.blind_frames = 0
+            else:
+                self.blind_frames += 1
+        else:
+            # opti cpu, on cherche plus la balle
+            ball_data = None   
 
-        # But LIDAR
-        if self.goal_detected and self.goal_angle is not None:
-            L  = 65
-            ax = int(w/2 - math.sin(self.goal_angle) * L)
-            ay = int(h - 40 - math.cos(self.goal_angle) * L)
-            ax, ay = max(10, min(w-10, ax)), max(10, min(h-10, ay))
-            cv2.arrowedLine(debug, (w//2, h-40), (ax, ay), (0, 100, 255), 3, tipLength=0.3)
-            gd_str = f"{self.goal_dist:.2f}m" if self.goal_dist else "?"
-            cv2.putText(debug, f"BUT {math.degrees(self.goal_angle):.0f}d {gd_str}",
-                        (ax+4, ay), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 100, 255), 1)
+        # on cherche toujours les poteaux par contre
+        posts_data = self._detect_red_posts(hsv)
 
-        # Barre de progression de l'observation
-        if self.state == STATE_OBSERVE and OBS_CONFIRM_FRAMES > 0:
-            pct   = self._obs_frames / OBS_CONFIRM_FRAMES
-            bar_w = int(w * pct)
-            cv2.rectangle(debug, (0, h-10), (bar_w, h), (0, 200, 255), -1)
-            cv2.putText(debug, f"OBS {self._obs_frames}/{OBS_CONFIRM_FRAMES}",
-                        (4, h-14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1)
-
-        # Plan calculé (waypoint + cap)
-        if self.plan_wp_x is not None and self.odom_x is not None:
-            cv2.putText(debug,
-                        f"WP=({self.plan_wp_x:.2f},{self.plan_wp_y:.2f})  "
-                        f"cap={math.degrees(self.plan_face_yaw):.0f}d",
-                        (4, h-28), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 0), 1)
-
-        # État + dist frontale
-        cv2.putText(debug, f"{self.state}  front={self.front_dist:.2f}m",
-                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 230, 255), 2)
-
-        # Masque pleine image colorisé en vert
-        mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        mask_vis[mask > 0] = (0, 200, 80)
-
-        cv2.imshow(WIN_DEBUG, np.hstack([debug, mask_vis]))
+        # interface graphique
+        debug = self._render_debug(frame, ball_data, posts_data)
+        try:
+            self.pub_debug.publish(self.bridge.cv2_to_imgmsg(debug, 'bgr8'))
+        except Exception:
+            pass
+        cv2.imshow("Challenge 4 v5 - Debug", debug)
         cv2.waitKey(1)
 
+        # on actualise la commande moteur
+        self.cmd_pending = self._fsm_step(ball_data, posts_data)
+
     # =========================================================================
-    # BOUCLE DE CONTRÔLE (20 Hz)
+    # Gestion memoire balle
     # =========================================================================
 
-    def _control_loop(self):
-        if self.odom_x is None:
-            return   # attendre la première mesure odométrique
+    def _refresh_ball_memory(self, ball_data: dict):
+        # met a jour les infos de la balle a chaque image
+        cx   = ball_data['cx']
+        err_norm    = (cx - self.image_width / 2.0) / self.image_width
+        self.ball_cx    = cx
+        self.ball_angle = -err_norm * CAMERA_FOV_RAD
 
-        twist = Twist()
+        d_lidar = self._min_front_dist()
+        
+        # si le laser bug on estime a la louche avec la camera
+        if d_lidar is not None and d_lidar < 2.0:
+            offset = self.get_parameter('dist_offset').value
+            self.ball_dist = max(0.05, d_lidar - offset)
+        else:
+            bx, by, bw, bh = ball_data['bbox']
+            if bw > 0:
+                self.ball_dist = (BALL_REAL_DIAM_M * CAMERA_FOCAL_EST) / bw
 
-        # ─── PHASE 1a : SCAN ─────────────────────────────────────────────────
-        # Le robot tourne UNIQUEMENT pour trouver la balle.
-        # Dès qu'elle est visible (même une seule frame), il s'arrête
-        # et passe en OBSERVE pour accumuler les mesures immobile.
-        # Le but (LIDAR) sera attendu pendant OBSERVE, pas ici.
+    def _lock_ball_and_convert_to_world(self):
+        # on sauvegarde definitivement la balle en coordonnees odom 
+        self.ball_locked = True
 
-        if self.state == STATE_SCAN:
-            if self.ball_cx != -1:
-                # Balle trouvée → s'arrêter immédiatement, initialiser les buffers
-                self._obs_frames = 0
-                self._obs_ball_angles.clear()
-                self._obs_ball_dists.clear()
-                self._obs_goal_angles.clear()
-                self._obs_goal_dists.clear()
-                self._transition(STATE_OBSERVE)
-                # twist reste à zéro → arrêt immédiat
+        if not self.odom_ok:
+            # bidouille si odom plante
+            lx, ly = polar_to_local(self.ball_dist, self.ball_angle)
+            self.ball_world_x = lx
+            self.ball_world_y = ly
+        else:
+            lx, ly = polar_to_local(self.ball_dist, self.ball_angle)
+            self.ball_world_x, self.ball_world_y = robot_to_world(
+                self.robot_x, self.robot_y, self.robot_yaw, lx, ly)
+
+
+    # =========================================================================
+    # Calculs geometriques
+    # =========================================================================
+
+    def _convert_goal_to_world(self, lidar_result: dict) -> tuple:
+        lx, ly = polar_to_local(lidar_result['center_dist'],
+                                 lidar_result['center_angle'])
+        return robot_to_world(self.robot_x, self.robot_y, self.robot_yaw, lx, ly)
+
+    def _compute_waypoint(self) -> tuple:
+        # calcule le point juste derriere la balle par rapport a la cage
+        bx, by   = self.ball_world_x, self.ball_world_y
+        gx, gy   = self.goal_world_x, self.goal_world_y
+        offset   = self.get_parameter('waypoint_offset').value
+
+        dx = gx - bx
+        dy = gy - by
+        d  = math.sqrt(dx*dx + dy*dy)
+        
+        if d < 1e-6:
+            return bx, by
+
+        ux = dx / d
+        uy = dy / d
+
+        self.push_vx = ux
+        self.push_vy = uy
+
+        wpx = bx - offset * ux
+        wpy = by - offset * uy
+
+        return wpx, wpy
+
+    # =========================================================================
+    # Vision camera
+    # =========================================================================
+
+    def _detect_ball(self, hsv: np.ndarray):
+        # cherche le gros blob jaune/vert
+        lo = np.array([self.get_parameter('ball_h_min').value,
+                       self.get_parameter('ball_s_min').value,
+                       self.get_parameter('ball_v_min').value], dtype=np.uint8)
+        hi = np.array([self.get_parameter('ball_h_max').value,
+                       self.get_parameter('ball_s_max').value,
+                       self.get_parameter('ball_v_max').value], dtype=np.uint8)
+        min_area = self.get_parameter('ball_min_area').value
+
+        mask = cv2.inRange(hsv, lo, hi)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return None
+            
+        best = max(cnts, key=cv2.contourArea)
+        area = cv2.contourArea(best)
+        if area < min_area:
+            return None
+            
+        M = cv2.moments(best)
+        if M['m00'] == 0:
+            return None
+            
+        return {
+            'cx': int(M['m10'] / M['m00']), 'cy': int(M['m01'] / M['m00']),
+            'area': area, 'contour': best, 'bbox': cv2.boundingRect(best),
+        }
+
+
+    def _detect_red_posts(self, hsv: np.ndarray) -> list:
+        # cherche les deux rectangles rouges bien verticaux
+        lo1 = np.array([self.get_parameter('red1_h_min').value,
+                        self.get_parameter('red1_s_min').value, 50], dtype=np.uint8)
+        hi1 = np.array([self.get_parameter('red1_h_max').value, 255, 255], dtype=np.uint8)
+        lo2 = np.array([self.get_parameter('red2_h_min').value,
+                        self.get_parameter('red2_s_min').value, 50], dtype=np.uint8)
+        hi2 = np.array([self.get_parameter('red2_h_max').value, 255, 255], dtype=np.uint8)
+
+        post_area  = self.get_parameter('post_min_area').value
+        aspect_min = self.get_parameter('post_aspect_min').value
+
+        mask = cv2.bitwise_or(cv2.inRange(hsv, lo1, hi1),
+                              cv2.inRange(hsv, lo2, hi2))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                                cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        posts = []
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+            if area < post_area:
+                continue
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            
+            # filtre ratio hauteur/largeur
+            if bh <= bw or bw == 0 or (bh / bw) < aspect_min:
+                continue
+            M = cv2.moments(cnt)
+            if M['m00'] == 0:
+                continue
+            posts.append({
+                'cx': int(M['m10'] / M['m00']), 'cy': int(M['m01'] / M['m00']),
+                'area': area, 'bbox': (bx, by, bw, bh), 'aspect': bh / bw,
+            })
+            
+        posts.sort(key=lambda p: p['cx'])
+        return posts
+
+    # =========================================================================
+    # Scan Laser 
+    # =========================================================================
+
+    def _lidar_find_goal_candidates(self):
+        # trouve 2 clusters au laser qui ressemblent a nos poteaux
+        if self.laserscan is None:
+            return None
+
+        goal_dist_min = self.get_parameter('goal_dist_min').value
+        goal_dist_max = self.get_parameter('goal_dist_max').value
+
+        cart = []
+        for idx in list(range(0, 91)) + list(range(270, 360)):
+            d = float(self.laserscan[idx])
+            if d >= LIDAR_MAX_RANGE:
+                continue
+            a = math.radians(idx) if idx <= 180 else math.radians(idx - 360)
+            cart.append((d * math.cos(a), d * math.sin(a), a, d))
+
+        if len(cart) < 2:
+            return None
+
+        cart.sort(key=lambda p: p[2])
+
+        clusters, cur = [], [cart[0]]
+        for i in range(1, len(cart)):
+            dx = cart[i][0] - cart[i-1][0]
+            dy = cart[i][1] - cart[i-1][1]
+            if math.sqrt(dx*dx + dy*dy) < CLUSTER_GAP:
+                cur.append(cart[i])
             else:
-                # Balayage oscillant ±SEARCH_MAX_ANGLE
-                self._scan_cum += 0.05 * SEARCH_OMEGA
-                if self._scan_cum > SEARCH_MAX_ANGLE:
-                    self._scan_cum = 0.0
-                    self._scan_dir = -self._scan_dir
-                twist.angular.z = SEARCH_OMEGA * self._scan_dir
+                clusters.append(cur)
+                cur = [cart[i]]
+        clusters.append(cur)
 
-        # ─── PHASE 1b : OBSERVE ──────────────────────────────────────────────
-        # Le robot est IMMOBILE. Il attend balle + but pour accumuler
-        # OBS_CONFIRM_FRAMES mesures stables.
-        #
-        # Règle clé : on ne retourne en SCAN que si la balle est VRAIMENT
-        # perdue (absente depuis > BALL_LOST_TIMEOUT secondes).
-        # Une ou deux frames manquantes = bruit normal → on ignore et on attend.
+        valid = []
+        for cl in clusters:
+            if len(cl) < CLUSTER_MIN_PTS:
+                continue
+            xs    = [p[0] for p in cl]
+            ys    = [p[1] for p in cl]
+            width = math.sqrt((max(xs) - min(xs))**2 + (max(ys) - min(ys))**2)
+            if width > POST_WIDTH_MAX:
+                continue
+            cx_cl = sum(xs) / len(cl)
+            cy_cl = sum(ys) / len(cl)
+            valid.append({
+                'lx': cx_cl, 'ly': cy_cl,
+                'dist':  math.sqrt(cx_cl**2 + cy_cl**2),
+                'angle': math.atan2(cy_cl, cx_cl),
+            })
 
-        elif self.state == STATE_OBSERVE:
-            now = self.get_clock().now()
+        for i in range(len(valid)):
+            for j in range(i + 1, len(valid)):
+                c1, c2  = valid[i], valid[j]
+                dx, dy  = c1['lx'] - c2['lx'], c1['ly'] - c2['ly']
+                inter_d = math.sqrt(dx*dx + dy*dy)
+                if goal_dist_min <= inter_d <= goal_dist_max:
+                    mx = (c1['lx'] + c2['lx']) / 2.0
+                    my = (c1['ly'] + c2['ly']) / 2.0
+                    return {
+                        'center_angle': math.atan2(my, mx),
+                        'center_dist':  math.sqrt(mx**2 + my**2),
+                        'inter_dist':   inter_d,
+                        'mid_lx': mx, 'mid_ly': my,        
+                    }
+        return None
 
-            # Initialiser le timer au premier tick de OBSERVE
-            if self._last_ball_seen is None:
-                self._last_ball_seen = now
+    # =========================================================================
+    # L'Aiguilleur des etats (le switch central)
+    # =========================================================================
 
-            ball_angle, ball_dist = self._ball_pixel_to_angle_dist()
+    def _fsm_step(self, ball_data, posts_data: list) -> Twist:
+        # securite de base si on fonce dans un mur pendant la phase d'approche
+        security_states = {STATE_SEARCH_BALL, STATE_MEMORIZE_BALL,
+                           STATE_NAVIGATE_TO_WAYPOINT}
+        if self.state in security_states and self._obstacle_front():
+            self.get_logger().warn("ARRET URGENCE")
+            return Twist()
 
-            # Mise à jour de l'horodatage si la balle est visible cette frame
-            if ball_angle is not None:
-                self._last_ball_seen = now
-
-            # Calcul du temps écoulé sans balle
-            age_ball = (now - self._last_ball_seen).nanoseconds / 1e9
-
-            if age_ball > BALL_LOST_TIMEOUT:
-                # Balle vraiment perdue (pas juste une frame de bruit) → SCAN
-                self.get_logger().warn(
-                    f"[OBSERVE] Balle perdue depuis {age_ball:.1f}s — retour SCAN")
-                self._obs_frames = 0
-                self._obs_ball_angles.clear()
-                self._obs_ball_dists.clear()
-                self._obs_goal_angles.clear()
-                self._obs_goal_dists.clear()
-                self._transition(STATE_SCAN)
-
-            elif ball_angle is not None and self.goal_detected \
-                    and self.goal_angle is not None and self.goal_dist is not None:
-                # Balle ET but visibles cette frame → accumulation
-                self._obs_ball_angles.append(ball_angle)
-                self._obs_ball_dists.append(ball_dist)
-                self._obs_goal_angles.append(self.goal_angle)
-                self._obs_goal_dists.append(self.goal_dist)
-                self._obs_frames += 1
-
-                if self._obs_frames >= OBS_CONFIRM_FRAMES:
-                    # ── PHASE 2 : PLANIFICATION ───────────────────────────────
-                    if self._compute_plan():
-                        self._transition(STATE_GOTO)
-                    else:
-                        self._obs_frames = 0
-                        self._obs_ball_angles.clear()
-                        self._obs_ball_dists.clear()
-                        self._obs_goal_angles.clear()
-                        self._obs_goal_dists.clear()
-                        self._transition(STATE_SCAN)
-            # else : balle ou but absents mais dans le délai toléré → on attend
-            # (twist reste à zéro → robot immobile)
-
-        # ─── PHASE 3a : GOTO ─────────────────────────────────────────────────
-        # Navigation vers le waypoint d'approche (en coordonnées monde).
-        #
-        # À chaque tick :
-        #   1. Calculer le vecteur (wp - robot) dans le repère monde
-        #   2. En déduire l'angle cible dans le repère robot : atan2(dy, dx) - yaw
-        #   3. Commande proportionnelle : omega = KP * angle_err
-        #                                  v    = proportionnel à cos(angle_err)
-
-        elif self.state == STATE_GOTO:
-            dx = self.plan_wp_x - self.odom_x
-            dy = self.plan_wp_y - self.odom_y
-            dist_to_wp = math.sqrt(dx**2 + dy**2)
-
-            if dist_to_wp < GOTO_POS_TOL:
-                self._transition(STATE_FACE)
-            else:
-                # Angle vers le waypoint dans le repère monde
-                target_yaw = math.atan2(dy, dx)
-                # Erreur angulaire dans le repère robot
-                angle_err  = _angle_diff(target_yaw, self.odom_yaw)
-
-                twist.angular.z = GOTO_KP_ANG * angle_err
-
-                # Vitesse : réduite si virage serré (cos passe de 1 à 0 pour 90°)
-                # On avance moins vite quand on est très décalé angulairement
-                fwd = math.cos(angle_err)    # [-1, 1]
-                fwd = max(0.0, fwd)          # on n'avance pas à reculons
-                twist.linear.x = GOTO_SPEED_MIN + (GOTO_SPEED_MAX - GOTO_SPEED_MIN) * fwd
-
-        # ─── PHASE 3b : FACE ─────────────────────────────────────────────────
-        # Rotation sur place pour s'aligner sur le cap de poussée.
-        # Le robot est au waypoint, il pivote jusqu'à faire face au but.
-
-        elif self.state == STATE_FACE:
-            angle_err = _angle_diff(self.plan_face_yaw, self.odom_yaw)
-
-            if abs(angle_err) < FACE_TOL:
-                # Aligné — mémoriser la position de départ de la poussée
-                self._push_start_x    = self.odom_x
-                self._push_start_y    = self.odom_y
-                self._push_dist_done  = 0.0
-                self._transition(STATE_PUSH)
-            else:
-                twist.angular.z = FACE_KP * angle_err
-                twist.linear.x  = 0.0
-
-        # ─── PHASE 3c : PUSH ─────────────────────────────────────────────────
-        # Avance en ligne droite sur plan_push_dist.
-        # Correction angulaire douce pour rester sur le cap.
-        # Arrêt dès que la distance cible est parcourue, ou obstacle trop proche.
-
-        elif self.state == STATE_PUSH:
-            # Distance parcourue depuis le début de la poussée (odométrie)
-            ddx = self.odom_x - self._push_start_x
-            ddy = self.odom_y - self._push_start_y
-            self._push_dist_done = math.sqrt(ddx**2 + ddy**2)
-
-            if self._push_dist_done >= self.plan_push_dist:
-                self.get_logger().info(
-                    f"[PUSH] Distance atteinte ({self._push_dist_done:.2f}m) — DONE")
-                self._transition(STATE_DONE)
-            elif self.front_dist < PUSH_STOP_DIST:
-                self.get_logger().warn(
-                    f"[PUSH] Obstacle frontal à {self.front_dist:.2f}m — DONE")
-                self._transition(STATE_DONE)
-            else:
-                # Correction angulaire pour rester sur le cap
-                angle_err       = _angle_diff(self.plan_face_yaw, self.odom_yaw)
-                twist.angular.z = FACE_KP * angle_err
-                twist.linear.x  = PUSH_SPEED
-
-        # ─── DONE ────────────────────────────────────────────────────────────
+        if self.state == STATE_SEARCH_BALL:
+            return self._state_search_ball(ball_data)
+        elif self.state == STATE_MEMORIZE_BALL:
+            return self._state_memorize_ball(ball_data)
+        elif self.state == STATE_SEARCH_GOAL:
+            return self._state_search_goal(posts_data)
+        elif self.state == STATE_COMPUTE_TRAJECTORY:
+            return self._state_compute_trajectory(posts_data)
+        elif self.state == STATE_NAVIGATE_TO_WAYPOINT:
+            return self._state_navigate_to_waypoint()
+        elif self.state == STATE_ALIGN_AND_PUSH:
+            return self._state_align_and_push(posts_data)
         elif self.state == STATE_DONE:
-            pass   # twist reste à zéro → robot immobile
-
-        self.cmd_pub.publish(twist)
+            return Twist()
+        return Twist()
 
     # =========================================================================
-    # UTILITAIRE : transition d'état avec log
+    # ETATS 
     # =========================================================================
 
-    def _transition(self, new_state):
-        if new_state != self.state:
-            self.get_logger().info(f"[ÉTAT] {self.state} → {new_state}")
-            self.state = new_state
+    def _state_search_ball(self, ball_data) -> Twist:
+        # on tourne en cherchant la balle
+        if ball_data is not None:
+            self._reset_pd()
+            self.stable_frames = 0
+            self.frames_aligned = 0
+            self.blind_frames   = 0
+            self._transition(STATE_MEMORIZE_BALL)
+            return self._pd_cmd(ball_data['cx'])
+        return self._spin_cmd()
+
+    def _state_memorize_ball(self, ball_data) -> Twist:
+        # on se centre sur la balle et on attends que ca stabilise
+        if ball_data is None:
+            self.blind_frames += 1
+            if self.blind_frames > BLIND_SPOT_FRAMES:
+                self.stable_frames  = 0
+                self.blind_frames   = 0
+                self.frames_aligned = 0
+                self._reset_pd()
+                self._transition(STATE_SEARCH_BALL)
+                return self._spin_cmd()
+            return self._pd_cmd(self.ball_cx)
+
+        self.blind_frames = 0
+        cx       = ball_data['cx']
+        err_norm = abs(cx - self.image_width / 2.0) / self.image_width
+        thresh   = self.get_parameter('align_err_thresh').value
+        n_frames = self.get_parameter('align_frames_ok').value
+
+        if err_norm < thresh:
+            self.stable_frames += 1
+        else:
+            self.stable_frames = max(0, self.stable_frames - 1)
+
+        # c'est bon, on est lock
+        if self.stable_frames >= n_frames:
+            self._lock_ball_and_convert_to_world()
+            self.stable_frames     = 0
+            self.frames_aligned    = 0
+            self.confirm_frames_count = 0
+            self._reset_pd()
+            self._reset_nav_pid()
+            self._transition(STATE_SEARCH_GOAL)
+            return self._spin_cmd()
+
+        return self._pd_cmd(cx)
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+    def _state_search_goal(self, posts_data: list) -> Twist:
+        # on balaie de gauche a droite pour trouver les cages
+        if len(posts_data) >= 2:
+            self.goal_cx_vision = (posts_data[0]['cx'] + posts_data[1]['cx']) / 2.0
+
+            err_norm_goal = (self.goal_cx_vision - self.image_width / 2.0) / self.image_width
+            goal_angle = -err_norm_goal * CAMERA_FOV_RAD   
+
+            lidar_goal = self._lidar_find_goal_candidates()
+            if lidar_goal is not None:
+                offset = self.get_parameter('dist_offset').value
+                goal_dist = max(0.10, lidar_goal['center_dist'] - offset)
+            else:
+                POST_REAL_HEIGHT_M = 0.30
+                avg_height_px = (posts_data[0]['bbox'][3] + posts_data[1]['bbox'][3]) / 2.0
+                if avg_height_px > 0:
+                    goal_dist = (POST_REAL_HEIGHT_M * CAMERA_FOCAL_EST) / avg_height_px
+                else:
+                    goal_dist = 1.0   
+
+            mid_lx = goal_dist * math.cos(goal_angle)
+            mid_ly = goal_dist * math.sin(goal_angle)
+            vision_goal = {
+                'center_angle': goal_angle,
+                'center_dist':  goal_dist,
+                'mid_lx':       mid_lx,
+                'mid_ly':       mid_ly,
+            }
+
+            self.confirm_frames_count += 1
+
+            n_conf = self.get_parameter('confirm_frames').value
+            if self.confirm_frames_count >= n_conf:
+                # poteaux valides
+                self._last_lidar_goal = lidar_goal if lidar_goal is not None else vision_goal
+                self.confirm_frames_count = 0
+                self._reset_pd()
+                self._reset_nav_pid()
+                self._transition(STATE_COMPUTE_TRAJECTORY)
+                return Twist()
+        else:
+            self.confirm_frames_count = max(0, self.confirm_frames_count - 1)
+
+        return self._spin_cmd()
+
+    def _state_compute_trajectory(self, posts_data: list) -> Twist:
+        # les gros calculs d'angles et point cible
+        if not self.odom_ok:
+            return Twist()
+
+        if self.ball_world_x is None or self.ball_world_y is None:
+            self._transition(STATE_SEARCH_BALL)
+            return Twist()
+
+        gx, gy = robot_to_world(
+            self.robot_x, self.robot_y, self.robot_yaw,
+            self._last_lidar_goal['mid_lx'],
+            self._last_lidar_goal['mid_ly']
+        )
+        self.goal_world_x = gx
+        self.goal_world_y = gy
+
+        self.waypoint_x, self.waypoint_y = self._compute_waypoint()
+
+        # on calcule ou on va s'arreter (apres la ligne)
+        overshoot = self.get_parameter('push_overshoot').value
+        self.end_point_x = gx + overshoot * self.push_vx
+        self.end_point_y = gy + overshoot * self.push_vy
+
+        self.nav_start_time = time.time()
+        self._reset_nav_pid()
+        self._transition(STATE_NAVIGATE_TO_WAYPOINT)
+        return Twist()
+
+    def _state_navigate_to_waypoint(self) -> Twist:
+        # on fonce vers le waypoint derriere la balle au pid
+        if self.waypoint_x is None:
+            self._transition(STATE_SEARCH_BALL)
+            return Twist()
+
+        elapsed = time.time() - self.nav_start_time
+        nav_timeout = self.get_parameter('nav_timeout').value
+        
+        # si on bloque trop longtemps on force le tir quand meme
+        if elapsed > nav_timeout:
+            self.push_start_time = time.time()
+            self._transition(STATE_ALIGN_AND_PUSH)
+            return Twist()
+
+        d_wp = dist2d(self.robot_x, self.robot_y, self.waypoint_x, self.waypoint_y)
+        arrival = self.get_parameter('nav_arrival_dist').value
+
+        # on y est !
+        if d_wp < arrival:
+            self.push_start_time = time.time()
+            self._transition(STATE_ALIGN_AND_PUSH)
+            return Twist()
+
+        cap_cible = math.atan2(
+            self.waypoint_y - self.robot_y,
+            self.waypoint_x - self.robot_x
+        )
+        err_angle = normalize_angle(cap_cible - self.robot_yaw)
+
+        t_now = time.time()
+        dt    = t_now - self.nav_t_prev if self.nav_t_prev > 0.0 else 0.05
+        self.nav_t_prev = t_now
+
+        kp_a = self.get_parameter('nav_ang_kp').value
+        ki_a = self.get_parameter('nav_ang_ki').value
+        kd_a = self.get_parameter('nav_ang_kd').value
+
+        self.nav_err_integral += err_angle * dt
+        self.nav_err_integral = float(np.clip(self.nav_err_integral, -1.0, 1.0))
+        derr = (err_angle - self.nav_err_prev) / dt if dt > 0 else 0.0
+        self.nav_err_prev = err_angle
+
+        omega = float(np.clip(
+            kp_a * err_angle + ki_a * self.nav_err_integral + kd_a * derr,
+            -self.get_parameter('omega_max').value,
+            self.get_parameter('omega_max').value
+        ))
+
+        kp_l  = self.get_parameter('nav_lin_kp').value
+        v_max = self.get_parameter('nav_lin_max').value
+        v_lin = float(np.clip(kp_l * d_wp, NAV_LIN_MIN, v_max))
+
+        # on gere l'approche en douceur (on tourne d'abord, on avance apres)
+        if abs(err_angle) > math.radians(45):
+            v_lin = 0.0
+        elif abs(err_angle) > math.radians(20):
+            v_lin *= 0.3
+
+        cmd = Twist()
+        cmd.linear.x  = v_lin
+        cmd.angular.z = omega
+        return cmd
+
+    def _state_align_and_push(self, posts_data: list) -> Twist:
+        # derniere ligne droite, on defonce la balle
+        push_timeout = self.get_parameter('push_timeout').value
+        push_v       = self.get_parameter('push_v').value
+        omega_max    = self.get_parameter('omega_max').value
+        kp_a         = self.get_parameter('nav_ang_kp').value
+
+        elapsed = time.time() - self.push_start_time
+
+        if elapsed > push_timeout:
+            self._transition(STATE_DONE)
+            return Twist()
+
+        # on verifie si on a franchi la ligne avec l'odom
+        if self.end_point_x is not None:
+            d_end = dist2d(self.robot_x, self.robot_y,
+                           self.end_point_x, self.end_point_y)
+            arrival = self.get_parameter('nav_arrival_dist').value
+            if d_end < arrival:
+                self._transition(STATE_DONE)
+                return Twist()
+
+        if len(posts_data) >= 2:
+            self.goal_cx_vision = (posts_data[0]['cx'] + posts_data[1]['cx']) / 2.0
+
+        cap_push = math.atan2(self.push_vy, self.push_vx)
+        err_push = normalize_angle(cap_push - self.robot_yaw)
+
+        # mix correction geo et visuelle
+        err_vis_norm = (self.goal_cx_vision - self.image_width / 2.0) / self.image_width
+        omega_geo = kp_a * err_push
+        omega_vis = -(err_vis_norm * self.get_parameter('ang_kp').value)
+        omega = float(np.clip(0.7 * omega_geo + 0.3 * omega_vis, -omega_max, omega_max))
+
+        cmd = Twist()
+        cmd.linear.x  = push_v
+        cmd.angular.z = omega
+        return cmd
+
+    # =========================================================================
+    # Helpers
+    # =========================================================================
+
+    def _pd_cmd(self, cx: int) -> Twist:
+        # simple pd pour se centrer sur qqch a l'ecran
+        kp = self.get_parameter('ang_kp').value
+        kd = self.get_parameter('ang_kd').value
+        om = self.get_parameter('omega_max').value
+
+        err_raw = (cx - self.image_width / 2.0) / self.image_width
+        self.err_ang_filt = ALPHA_FILT * self.err_ang_filt + (1.0 - ALPHA_FILT) * err_raw
+        derr = self.err_ang_filt - self.err_ang_prev
+        self.err_ang_prev = self.err_ang_filt
+
+        t = Twist()
+        t.angular.z = float(np.clip(-(kp * self.err_ang_filt + kd * derr), -om, om))
+        return t
+
+    def _spin_cmd(self) -> Twist:
+        # notre balayage radar a 180 degres (comme un essuie glace)
+        omega = self.get_parameter('search_omega').value
+        t = Twist()
+
+        if self.yaw_initial is None:
+            t.angular.z = omega
+            return t
+
+        deviation = normalize_angle(self.robot_yaw - self.yaw_initial)
+
+        # on tape sur les bords = on repart dans l'autre sens
+        if deviation >= SWEEP_HALF_ANGLE and self.sweep_direction > 0:
+            self.sweep_direction = -1.0
+        elif deviation <= -SWEEP_HALF_ANGLE and self.sweep_direction < 0:
+            self.sweep_direction = 1.0
+
+        t.angular.z = self.sweep_direction * omega
+        return t
+
+    def _reset_pd(self):
+        self.err_ang_prev = 0.0
+        self.err_ang_filt = 0.0
+
+    def _reset_nav_pid(self):
+        self.nav_err_prev     = 0.0
+        self.nav_err_integral = 0.0
+        self.nav_t_prev       = 0.0
+
+    def _full_reset(self):
+        # fonction de reset total en cas de bug
+        self.ball_locked   = False
+        self.ball_world_x  = None
+        self.ball_world_y  = None
+        self.goal_world_x  = None
+        self.goal_world_y  = None
+        self.waypoint_x    = None
+        self.waypoint_y    = None
+        self.stable_frames = 0
+        self.blind_frames  = 0
+        self.confirm_frames_count = 0
+        self.sweep_direction = -1.0
+        self._reset_pd()
+        self._reset_nav_pid()
+        self._transition(STATE_SEARCH_BALL)
+
+    def _min_front_dist(self):
+        # regarde juste devant pour pas s'emplafonner
+        if self.laserscan is None:
+            return None
+        front = np.concatenate((self.laserscan[0:20], self.laserscan[340:360]))
+        return float(np.min(front))
+
+    def _obstacle_front(self) -> bool:
+        d = self._min_front_dist()
+        return d is not None and d < self.get_parameter('safety_dist').value
+
+    def _transition(self, new_state: str):
+        self.get_logger().info(f"Changement d'etat : {self.state} -> {new_state}")
+        self.state = new_state
+
+    # =========================================================================
+    # Rendu debug (camera + minimap)
+    # =========================================================================
+
+    def _render_debug(self, frame: np.ndarray,
+                      ball_data, posts_data: list) -> np.ndarray:
+        # trace les carres et les infos sur le retour camera 
+        debug = frame.copy()
+        h_img, w_img = debug.shape[:2]
+
+        cv2.line(debug, (w_img // 2, 0), (w_img // 2, h_img), (255, 120, 0), 1)
+
+        if ball_data is not None:
+            cx, cy = ball_data['cx'], ball_data['cy']
+            bx, by, bw, bh = ball_data['bbox']
+            cv2.drawContours(debug, [ball_data['contour']], -1, (0, 255, 0), 2)
+            cv2.rectangle(debug, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
+            cv2.drawMarker(debug, (cx, cy), (255, 0, 0), cv2.MARKER_CROSS, 20, 2)
+            cv2.line(debug, (cx, cy), (w_img // 2, cy), (0, 180, 255), 1)
+            cv2.putText(debug, f"Balle ({ball_data['area']:.0f}px) d~{self.ball_dist:.2f}m",
+                        (bx, max(by - 6, 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+        elif self.ball_locked:
+            cv2.putText(debug, "BALLE lock (odom)",
+                        (10, h_img - 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 2)
+        elif not self.ball_locked and self.blind_frames > 0:
+            cv2.putText(debug, f"BALLE pas la ({self.blind_frames})",
+                        (10, h_img - 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
+
+        if self.state == STATE_MEMORIZE_BALL:
+            n_req = self.get_parameter('align_frames_ok').value
+            pct   = int(self.stable_frames / max(n_req, 1) * 100)
+            bar_w = int(w_img * 0.4 * pct / 100)
+            cv2.rectangle(debug, (10, 55), (10 + int(w_img * 0.4), 70),
+                          (50, 50, 50), -1)
+            cv2.rectangle(debug, (10, 55), (10 + bar_w, 70), (0, 255, 0), -1)
+            cv2.putText(debug, f"Load: {pct}%",
+                        (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        for i, post in enumerate(posts_data):
+            bx, by, bw, bh = post['bbox']
+            cv2.rectangle(debug, (bx, by), (bx + bw, by + bh), (255, 0, 255), 2)
+            cv2.drawMarker(debug, (post['cx'], post['cy']),
+                           (255, 255, 255), cv2.MARKER_CROSS, 16, 2)
+            cv2.putText(debug, f"P{i} h/w={post['aspect']:.1f}",
+                        (bx, max(by - 6, 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 0, 255), 1)
+
+        if len(posts_data) >= 2:
+            p0  = (posts_data[0]['cx'], posts_data[0]['cy'])
+            p1  = (posts_data[1]['cx'], posts_data[1]['cy'])
+            mid = ((p0[0] + p1[0]) // 2, (p0[1] + p1[1]) // 2)
+            cv2.line(debug, p0, p1, (255, 0, 255), 1)
+            cv2.circle(debug, mid, 6, (0, 255, 255), -1)
+            cv2.putText(debug, "CAGE OK",
+                        (mid[0] - 35, mid[1] - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+        state_colors = {
+            STATE_SEARCH_BALL:          (0, 200, 255),
+            STATE_MEMORIZE_BALL:        (0, 255, 100),
+            STATE_SEARCH_GOAL:          (0, 165, 255),
+            STATE_COMPUTE_TRAJECTORY:   (255, 200, 0),
+            STATE_NAVIGATE_TO_WAYPOINT: (200, 100, 255),
+            STATE_ALIGN_AND_PUSH:       (0, 0, 255),
+        }
+        cv2.putText(debug, self.state, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.70,
+                    state_colors.get(self.state, (255, 255, 255)), 2)
+        if self.ball_locked:
+            cv2.putText(debug, "[LOCK]", (10, 52),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 165, 255), 1)
+
+        h_min = int(self.get_parameter('ball_h_min').value)
+        h_max = int(self.get_parameter('ball_h_max').value)
+        s_min = int(self.get_parameter('ball_s_min').value)
+        v_min = int(self.get_parameter('ball_v_min').value)
+        asp   = self.get_parameter('post_aspect_min').value
+        odom_str = (f"odom ({self.robot_x:.2f},{self.robot_y:.2f}) "
+                    f"yaw={math.degrees(self.robot_yaw):.0f}deg"
+                    if self.odom_ok else "odom: WAIT")
+        cv2.putText(debug,
+                    f"HSV H[{h_min},{h_max}] S>={s_min} V>={v_min} | "
+                    f"h/w>={asp:.1f} | {odom_str}",
+                    (10, h_img - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (160, 160, 160), 1)
+        ball_str = (f"ball=({self.ball_world_x:.2f},{self.ball_world_y:.2f})"
+                    if self.ball_world_x is not None
+                    else f"ball d={self.ball_dist:.2f}m a={math.degrees(self.ball_angle):.0f}d")
+        goal_str = (f" goal=({self.goal_world_x:.2f},{self.goal_world_y:.2f})"
+                    if self.goal_world_x is not None else "")
+        wp_str   = (f" wp=({self.waypoint_x:.2f},{self.waypoint_y:.2f})"
+                    if self.waypoint_x is not None else "")
+        cv2.putText(debug, ball_str + goal_str + wp_str,
+                    (10, h_img - 27),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (160, 160, 160), 1)
+
+        debug = self._render_minimap(debug)
+
+        return debug
+
+    def _render_minimap(self, debug: np.ndarray) -> np.ndarray:
+        # petite minimap radar pour voir si nos coordonnees odom font n'imp
+        MAP_SIZE  = 160    
+        MAP_SCALE = 0.04   
+        cx_map    = MAP_SIZE // 2
+        cy_map    = MAP_SIZE // 2
+
+        overlay = debug.copy()
+        cv2.rectangle(overlay, (0, 0), (MAP_SIZE, MAP_SIZE), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.75, debug, 0.25, 0, debug)
+
+        for gx in range(0, MAP_SIZE, 50):
+            cv2.line(debug, (gx, 0), (gx, MAP_SIZE), (40, 40, 40), 1)
+        for gy in range(0, MAP_SIZE, 50):
+            cv2.line(debug, (0, gy), (MAP_SIZE, gy), (40, 40, 40), 1)
+
+        def w2m(wx: float, wy: float) -> tuple:
+            # passe le repere map sur le petit radar
+            dx = wx - self.robot_x   
+            dy = wy - self.robot_y
+            cos_y = math.cos(-self.robot_yaw)
+            sin_y = math.sin(-self.robot_yaw)
+            rx =  cos_y * dx - sin_y * dy
+            ry =  sin_y * dx + cos_y * dy
+            px = cx_map - int(ry / MAP_SCALE)   
+            py = cy_map - int(rx / MAP_SCALE)   
+            return px, py
+
+        cv2.rectangle(debug, (0, 0), (MAP_SIZE - 1, MAP_SIZE - 1), (100, 100, 100), 1)
+
+        wp_rad_px = int(self.get_parameter('waypoint_offset').value / MAP_SCALE)
+        cv2.circle(debug, (cx_map, cy_map), wp_rad_px, (60, 60, 60), 1)
+
+        fwd_px = cx_map
+        fwd_py = cy_map - 20
+        cv2.arrowedLine(debug, (cx_map, cy_map), (fwd_px, fwd_py),
+                        (200, 200, 200), 1, tipLength=0.3)
+
+        tri = np.array([[cx_map, cy_map - 8],
+                        [cx_map - 5, cy_map + 5],
+                        [cx_map + 5, cy_map + 5]], dtype=np.int32)
+        cv2.fillPoly(debug, [tri], (220, 220, 220))
+
+        if self.ball_world_x is not None:
+            bpx, bpy = w2m(self.ball_world_x, self.ball_world_y)
+            if 0 <= bpx < MAP_SIZE and 0 <= bpy < MAP_SIZE:
+                cv2.circle(debug, (bpx, bpy), 5, (0, 220, 0), -1)
+                cv2.putText(debug, "B", (bpx + 6, bpy + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 220, 0), 1)
+
+        if self.goal_world_x is not None:
+            gpx, gpy = w2m(self.goal_world_x, self.goal_world_y)
+            if 0 <= gpx < MAP_SIZE and 0 <= gpy < MAP_SIZE:
+                diamond = np.array([[gpx, gpy - 6], [gpx + 5, gpy],
+                                    [gpx, gpy + 6], [gpx - 5, gpy]], dtype=np.int32)
+                cv2.polylines(debug, [diamond], True, (0, 255, 255), 1)
+                cv2.putText(debug, "G", (gpx + 7, gpy + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 255, 255), 1)
+
+        if self.waypoint_x is not None:
+            wpx_px, wpy_px = w2m(self.waypoint_x, self.waypoint_y)
+            if 0 <= wpx_px < MAP_SIZE and 0 <= wpy_px < MAP_SIZE:
+                for angle_star in range(0, 360, 72):
+                    a_rad = math.radians(angle_star)
+                    ex = wpx_px + int(6 * math.cos(a_rad))
+                    ey = wpy_px + int(6 * math.sin(a_rad))
+                    cv2.line(debug, (wpx_px, wpy_px), (ex, ey), (0, 220, 220), 1)
+                cv2.putText(debug, "W", (wpx_px + 7, wpy_px + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 220, 220), 1)
+
+        if self.end_point_x is not None:
+            epx_px, epy_px = w2m(self.end_point_x, self.end_point_y)
+            if 0 <= epx_px < MAP_SIZE and 0 <= epy_px < MAP_SIZE:
+                cv2.rectangle(debug,
+                              (epx_px - 4, epy_px - 4),
+                              (epx_px + 4, epy_px + 4),
+                              (0, 140, 255), 1)   
+                cv2.putText(debug, "E", (epx_px + 6, epy_px + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 140, 255), 1)
+
+        if self.ball_world_x is not None and self.goal_world_x is not None:
+            bpx, bpy = w2m(self.ball_world_x, self.ball_world_y)
+            gpx, gpy = w2m(self.goal_world_x, self.goal_world_y)
+            bpx_c = max(0, min(MAP_SIZE - 1, bpx))
+            bpy_c = max(0, min(MAP_SIZE - 1, bpy))
+            gpx_c = max(0, min(MAP_SIZE - 1, gpx))
+            gpy_c = max(0, min(MAP_SIZE - 1, gpy))
+            cv2.arrowedLine(debug, (bpx_c, bpy_c), (gpx_c, gpy_c),
+                            (0, 0, 200), 1, tipLength=0.15)
+
+        cv2.putText(debug, "B=balle G=cage W=wp E=end",
+                    (2, MAP_SIZE - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (120, 120, 120), 1)
+
+        return debug
+
+
+    def _publish_cmd(self):
+        self.pub_cmd.publish(self.cmd_pending)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -792,6 +1118,7 @@ def main(args=None):
         node.destroy_node()
         cv2.destroyAllWindows()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
